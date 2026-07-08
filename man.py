@@ -1641,7 +1641,7 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
         # .PP / .LP — 段落分隔
         if stripped in ('.PP', '.LP', '.P', '.PP ') or stripped.startswith('.PP '):
             if in_synopsis:
-                pass
+                synopsis_lines.append(line)
             else:
                 flush_para()
                 out.append("")
@@ -1649,14 +1649,18 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
 
         # .br — 行分隔
         if stripped == '.br':
-            if not in_synopsis:
+            if in_synopsis:
+                synopsis_lines.append(line)
+            else:
                 flush_para()
                 out.append("")
             continue
 
         # .RS / .RE — 缩进（跳过，输出空行分隔）
         if stripped.startswith('.RS') or stripped.startswith('.RE'):
-            if not in_synopsis:
+            if in_synopsis:
+                synopsis_lines.append(line)
+            else:
                 flush_para()
                 out.append("")
             continue
