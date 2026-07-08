@@ -1337,6 +1337,12 @@ def th_clean_escapes(text: str) -> str:
     text = text.replace(r'\(ga', '`')
     # \*(Aq → '
     text = text.replace(r'\*(Aq', "'")
+    # \*(C` → `（Pod::Man 左引号，类似反引号）
+    text = text.replace(r'\*(C`', '`')
+    # \*(C' → '（Pod::Man 右引号）
+    text = text.replace(r"\*(C'", "'")
+    # \*(XX — 其他通用字符串引用（跳过）
+    text = re.sub(r'\\\*\([A-Z][A-Za-z]', '', text)
     # \m[blue] \m[] — 颜色标记（跳过）
     text = re.sub(r'\\m\[[^\]]*\]', '', text)
     # \s-2 \s+2 — 字号（跳过）
@@ -1351,15 +1357,17 @@ def th_clean_escapes(text: str) -> str:
 
 
 def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) -> str:
-    """处理 .TH 格式的内联字体标记 \\fB \\fI \\fR \\fP。
+    """处理 .TH 格式的内联字体标记 \\fB \\fI \\fR \\fP \\f(CW。
 
     man 格式的字体切换是顺序的（非嵌套）：
     \\fB 设置当前字体为加粗
     \\fI 设置当前字体为斜体
     \\fR 设置当前字体为 roman（常规）
     \\fP 返回上一字体
+    \\f(CW 设置当前字体为等宽（Constant Width）
 
-    使用 ** 表示 bold，_ 表示 italic（避免 ** 与 * 混合产生 *** 歧义）。
+    使用 ** 表示 bold，_ 表示 italic（避免 ** 与 * 混合产生 *** 歧义），
+    ` 表示等宽字体。
 
     state: 可选的状态字典 {'current': 'R', 'prev': 'R'}，用于跨行状态传递。
            若传入则函数会更新状态，调用方负责在段落边界重置。
@@ -1375,12 +1383,13 @@ def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) ->
     n = len(text)
     while i < n:
         if text[i] == '\\' and i + 1 < n and text[i + 1] == 'f' and i + 2 < n:
+            # 单字符字体名：\\fB \\fI \\fR \\fP
             font = text[i + 2]
             if font in ('B', 'I', 'R', 'P'):
                 new_font = font
                 if font == 'P':
                     new_font = prev_font
-                # 无操作：新字体与当前字体相同（如 \fB 后紧跟 \fB）
+                # 无操作：新字体与当前字体相同（如 \\fB 后紧跟 \\fB）
                 if new_font == current_font:
                     i += 3
                     continue
@@ -1392,6 +1401,8 @@ def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) ->
                     result.append('**')
                 elif current_font == 'I':
                     result.append('_')
+                elif current_font == 'CW':
+                    result.append('`')
                 current_font = new_font
                 # 开启新字体标记
                 if current_font == 'B':
@@ -1399,6 +1410,31 @@ def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) ->
                 elif current_font == 'I':
                     result.append('_')
                 i += 3
+                continue
+            # 双字符字体名：\\f(CW \\f(CR 等
+            if i + 4 < n and text[i + 2] == '(' and text[i + 3:i + 5].isalpha():
+                font_name = text[i + 3:i + 5]
+                new_font = font_name
+                if new_font == current_font:
+                    i += 5
+                    continue
+                prev_font = current_font
+                # 关闭当前字体标记
+                if current_font == 'B':
+                    result.append('**')
+                elif current_font == 'I':
+                    result.append('_')
+                elif current_font == 'CW':
+                    result.append('`')
+                current_font = new_font
+                # 开启新字体标记
+                if current_font == 'CW':
+                    result.append('`')
+                elif current_font == 'B':
+                    result.append('**')
+                elif current_font == 'I':
+                    result.append('_')
+                i += 5
                 continue
         result.append(text[i])
         i += 1
@@ -1412,12 +1448,16 @@ def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) ->
             result.append('**')
         elif current_font == 'I':
             result.append('_')
+        elif current_font == 'CW':
+            result.append('`')
     return ''.join(result)
 
 
 def th_strip_font_markup(text: str) -> str:
-    """移除文本中的 \\fB \\fI \\fR \\fP 字体标记，仅保留内容（用于代码块内）。"""
-    return re.sub(r'\\f[BIRP]', '', text)
+    """移除文本中的 \\fB \\fI \\fR \\fP \\f(CW 等字体标记，仅保留内容（用于代码块内）。"""
+    text = re.sub(r'\\f[BIRP]', '', text)
+    text = re.sub(r'\\f\([A-Z]{2}', '', text)
+    return text
 
 
 def th_split_macro_args(line: str) -> Tuple[str, List[str]]:
@@ -1506,6 +1546,21 @@ TH_SECTION_MAP = {
 }
 
 
+def _strip_podman_preamble(lines: List[str]) -> List[str]:
+    """去除 Pod::Man 自动生成的前导码（roff 宏定义块）。
+
+    Pod::Man 生成的文件以 .de Sp/Vb/Ve/IX 等宏定义开头，
+    这些宏定义在 markdown 转换中无意义，需要去除。
+    返回去除前导码后的行列表。
+    """
+    # 找到第一个 .TH 行，之前的所有内容都是前导码
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith('.TH'):
+            return lines[i:]
+    return lines
+
+
 def convert_th_to_markdown(text: str, display_name: str, section: int,
                            xref: CrossRefDB) -> str:
     """将 .TH 格式 man 页面转换为 markdown。
@@ -1516,7 +1571,8 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
     使用段落缓冲区收集普通文本行，遇到边界时合并并统一处理字体标记，
     解决跨行 \\fB...\\fI...\\fB 标记的状态丢失问题。
     """
-    lines = text.splitlines()
+    raw_lines = text.splitlines()
+    lines = _strip_podman_preamble(raw_lines)
     out: List[str] = []
     out.append(f"# {display_name.lower()}({section})")
     out.append("")
@@ -1596,12 +1652,20 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
             continue
 
         # 跳过的 roff 控制宏
-        if re.match(r'^\.(nr|ds|ie|el|nh|ad|ft|in|ti|ta|ll|po|pl|ne|hy|IX|rs|re|HP|cw|ps|cs)\b', stripped) or \
-           re.match(r'^\.(nr|ds|ie|el|nh|ad|ft|in|ti|ta|ll|po|pl|ne|hy|IX|rs|re|HP|cw|ps|cs)$', stripped):
+        if re.match(r'^\.(nr|ds|ie|el|nh|ad|ft|in|ti|ta|ll|po|pl|ne|hy|IX|rs|re|HP|cw|ps|cs|rr|tm)\b', stripped) or \
+           re.match(r'^\.(nr|ds|ie|el|nh|ad|ft|in|ti|ta|ll|po|pl|ne|hy|IX|rs|re|HP|cw|ps|cs|rr|tm)$', stripped):
             continue
         if stripped == '.DT':
             continue
         if stripped.startswith('.INDENT') or stripped.startswith('.UNINDENT'):
+            continue
+        # Pod::Man 宏：.Sp（垂直间距）、.PD（段落间距）
+        if stripped == '.Sp' or stripped.startswith('.Sp '):
+            if not in_code_block:
+                flush_para()
+                out.append("")
+            continue
+        if stripped == '.PD' or stripped.startswith('.PD '):
             continue
         if stripped == '.sp' or stripped == '.sp 1' or stripped.startswith('.sp '):
             if in_synopsis:
