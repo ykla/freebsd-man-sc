@@ -1305,6 +1305,14 @@ def th_clean_escapes(text: str) -> str:
     text = text.replace(r'\-', '-')
     # \\ → \
     text = text.replace(r'\\', '\\')
+    # \% → 空字符串（可选连字符，输出中不可见）
+    text = text.replace(r'\%', '')
+    # \  → 空格（转义空格）
+    text = text.replace('\\ ', ' ')
+    # \| → 空字符串（细空格）
+    text = text.replace(r'\|', '')
+    # \^ → 空字符串（1/6 em 空格）
+    text = text.replace(r'\^', '')
     # \0 → 空格（非断行空格）
     text = text.replace(r'\0', ' ')
     # \& → 空字符串（零宽占位符）
@@ -1342,7 +1350,7 @@ def th_clean_escapes(text: str) -> str:
     return text
 
 
-def th_process_font_markup(text: str) -> str:
+def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) -> str:
     """处理 .TH 格式的内联字体标记 \\fB \\fI \\fR \\fP。
 
     man 格式的字体切换是顺序的（非嵌套）：
@@ -1350,10 +1358,19 @@ def th_process_font_markup(text: str) -> str:
     \\fI 设置当前字体为斜体
     \\fR 设置当前字体为 roman（常规）
     \\fP 返回上一字体
+
+    使用 ** 表示 bold，_ 表示 italic（避免 ** 与 * 混合产生 *** 歧义）。
+
+    state: 可选的状态字典 {'current': 'R', 'prev': 'R'}，用于跨行状态传递。
+           若传入则函数会更新状态，调用方负责在段落边界重置。
     """
+    if state is None:
+        current_font = 'R'
+        prev_font = 'R'
+    else:
+        current_font = state.get('current', 'R')
+        prev_font = state.get('prev', 'R')
     result: List[str] = []
-    current_font = 'R'  # R=roman, B=bold, I=italic
-    prev_font = 'R'
     i = 0
     n = len(text)
     while i < n:
@@ -1363,30 +1380,40 @@ def th_process_font_markup(text: str) -> str:
                 new_font = font
                 if font == 'P':
                     new_font = prev_font
+                # 只在字体真正改变时更新 prev_font
+                if font != 'P' and new_font != current_font:
+                    prev_font = current_font
                 # 关闭当前字体标记
                 if current_font == 'B':
                     result.append('**')
                 elif current_font == 'I':
-                    result.append('*')
-                # 切换字体
-                if font != 'P':
-                    prev_font = current_font
+                    result.append('_')
                 current_font = new_font
                 # 开启新字体标记
                 if current_font == 'B':
                     result.append('**')
                 elif current_font == 'I':
-                    result.append('*')
+                    result.append('_')
                 i += 3
                 continue
         result.append(text[i])
         i += 1
-    # 关闭未闭合的标记
-    if current_font == 'B':
-        result.append('**')
-    elif current_font == 'I':
-        result.append('*')
+    # 更新状态（不关闭未闭合的标记，由调用方在段落边界处理）
+    if state is not None:
+        state['current'] = current_font
+        state['prev'] = prev_font
+    else:
+        # 无状态模式（独立行处理）：关闭未闭合的标记
+        if current_font == 'B':
+            result.append('**')
+        elif current_font == 'I':
+            result.append('_')
     return ''.join(result)
+
+
+def th_strip_font_markup(text: str) -> str:
+    """移除文本中的 \\fB \\fI \\fR \\fP 字体标记，仅保留内容（用于代码块内）。"""
+    return re.sub(r'\\f[BIRP]', '', text)
 
 
 def th_split_macro_args(line: str) -> Tuple[str, List[str]]:
@@ -1427,12 +1454,12 @@ def th_format_alternating(macro: str, args: List[str]) -> str:
     """处理交替字体宏 .BR .BI .IR .RB .RI .IB 等。
 
     .BR a b c → **a** b **c**（B/R 交替）
-    .BI a b → **a** *b*
-    .IR a b → *a* b
+    .BI a b → **a** _b_
+    .IR a b → _a_ b
     """
     if not macro or len(macro) < 2:
         return ' '.join(args)
-    fonts = list(macro[1:])  # 如 'BR' → ['B', 'R']
+    fonts = list(macro)  # 如 'BR' → ['B', 'R']
     result: List[str] = []
     for idx, arg in enumerate(args):
         font = fonts[idx % len(fonts)]
@@ -1440,7 +1467,7 @@ def th_format_alternating(macro: str, args: List[str]) -> str:
         if font == 'B':
             result.append(f'**{cleaned}**')
         elif font == 'I':
-            result.append(f'*{cleaned}*')
+            result.append(f'_{cleaned}_')
         else:  # R
             result.append(cleaned)
     return ''.join(result)
@@ -1481,6 +1508,9 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
 
     处理 .TH .SH .SS .B .I .BR .BI .IR .TP .PP .nf .fi 等宏，
     以及 \\fB \\fI \\fR \\fP 内联字体标记。
+
+    使用段落缓冲区收集普通文本行，遇到边界时合并并统一处理字体标记，
+    解决跨行 \\fB...\\fI...\\fB 标记的状态丢失问题。
     """
     lines = text.splitlines()
     out: List[str] = []
@@ -1500,6 +1530,30 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
 
     # 当前章节
     current_section = ""
+
+    # 段落缓冲区：收集普通文本行（仅 clean_escapes，未处理字体标记）
+    # 遇到边界时 flush：合并为一行，统一处理字体标记
+    para_buffer: List[str] = []
+
+    def flush_para():
+        """合并段落缓冲区，处理字体标记，输出。"""
+        if not para_buffer:
+            return
+        merged = ' '.join(p.strip() for p in para_buffer if p.strip())
+        merged = re.sub(r' {2,}', ' ', merged)
+        if not merged:
+            para_buffer.clear()
+            return
+        # 统一处理字体标记（跨行状态在此解决）
+        content = th_process_font_markup(merged)
+        # 交叉引用链接化
+        content = linkify_xref(content, section, xref)
+        # 如果前一行是列表项，合并为描述
+        if out and out[-1].startswith('- ') and not out[-1].endswith('```'):
+            out[-1] = out[-1] + ' ' + content
+        else:
+            out.append(content)
+        para_buffer.clear()
 
     for line in lines:
         # 跳过注释行
@@ -1524,6 +1578,7 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
             elif in_synopsis:
                 pass  # synopsis 内空行忽略
             else:
+                flush_para()
                 out.append("")
             continue
 
@@ -1546,6 +1601,7 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
             continue
         if stripped == '.sp' or stripped == '.sp 1' or stripped.startswith('.sp '):
             if not in_code_block and not in_synopsis:
+                flush_para()
                 out.append("")
             continue
 
@@ -1554,6 +1610,7 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
             if in_synopsis:
                 pass  # synopsis 内不嵌套代码块
             else:
+                flush_para()
                 in_code_block = True
                 out.append("```sh")
             continue
@@ -1566,9 +1623,10 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
                 in_code_block = False
             continue
 
-        # 代码块内：直接输出（清理转义）
+        # 代码块内：直接输出（清理转义 + 移除字体标记）
         if in_code_block:
             content = th_clean_escapes(line)
+            content = th_strip_font_markup(content)
             out.append(content)
             continue
 
@@ -1577,18 +1635,21 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
             if in_synopsis:
                 pass
             else:
+                flush_para()
                 out.append("")
             continue
 
         # .br — 行分隔
         if stripped == '.br':
             if not in_synopsis:
+                flush_para()
                 out.append("")
             continue
 
         # .RS / .RE — 缩进（跳过，输出空行分隔）
         if stripped.startswith('.RS') or stripped.startswith('.RE'):
             if not in_synopsis:
+                flush_para()
                 out.append("")
             continue
 
@@ -1602,12 +1663,15 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
                     out.extend(syn_out)
                     synopsis_lines = []
 
+            flush_para()
             # 提取章节名
             sec_name = stripped[3:].strip()
             # 去除引号
             sec_name = sec_name.strip('"').strip("'")
+            # 清理转义
+            sec_name = th_clean_escapes(sec_name)
             # 去除多余空格
-            sec_name = re.sub(r'\s+', ' ', sec_name)
+            sec_name = re.sub(r'\s+', ' ', sec_name).strip()
             current_section = sec_name.upper()
 
             # SYNOPSIS 章节特殊处理
@@ -1634,8 +1698,10 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
                     out.extend(syn_out)
                     synopsis_lines = []
 
+            flush_para()
             sub_name = stripped[3:].strip().strip('"').strip("'")
-            sub_name = re.sub(r'\s+', ' ', sub_name)
+            sub_name = th_clean_escapes(sub_name)
+            sub_name = re.sub(r'\s+', ' ', sub_name).strip()
             out.append(f"### {sub_name}")
             out.append("")
             continue
@@ -1649,6 +1715,7 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
                     syn_out = _th_format_synopsis(synopsis_lines, display_name, section, xref)
                     out.extend(syn_out)
                     synopsis_lines = []
+            flush_para()
             pending_tp = True
             continue
 
@@ -1661,6 +1728,7 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
                     syn_out = _th_format_synopsis(synopsis_lines, display_name, section, xref)
                     out.extend(syn_out)
                     synopsis_lines = []
+            flush_para()
             # .IP 类似 .TP，但标签在同行的参数中
             _, args = th_split_macro_args(stripped)
             if args:
@@ -1680,15 +1748,16 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
         if m:
             macro = m.group(1)
             rest = m.group(2)
+            flush_para()
             # 分割参数
             if macro in ('B', 'I', 'SB', 'SM'):
-                # .B text → **text** 或 *text*
+                # .B text → **text** 或 _text_
                 content = th_clean_escapes(rest)
                 content = th_process_font_markup(content)
                 if macro in ('B', 'SB'):
                     formatted = f'**{content}**' if not content.startswith('**') else content
                 else:  # I, SM
-                    formatted = f'*{content}*' if not content.startswith('*') else content
+                    formatted = f'_{content}_' if not content.startswith('_') else content
             else:
                 # .BR .BI .IR .RB .RI .IB — 交替字体
                 _, args = th_split_macro_args(stripped)
@@ -1705,21 +1774,20 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
             continue
 
         # 普通文本行（含 \fB \fI 等内联标记）
+        # 只做 clean_escapes，加入段落缓冲区，统一处理字体标记
         content = th_clean_escapes(line)
-        content = th_process_font_markup(content)
 
         if pending_tp:
             # 这是 .TP 后的标签行（普通文本）
-            out.append(f"- {content}")
+            content_processed = th_process_font_markup(content)
+            out.append(f"- {content_processed}")
             pending_tp = False
         else:
-            # 交叉引用链接化
-            content = linkify_xref(content, section, xref)
-            # 如果前一行是 "- tag"（列表项），当前行是描述，合并
-            if out and out[-1].startswith('- '):
-                out[-1] = out[-1] + ' ' + content
-            else:
-                out.append(content)
+            # 加入段落缓冲区
+            para_buffer.append(content)
+
+    # flush 残留段落
+    flush_para()
 
     # 处理 SYNOPSIS 章节末尾
     if in_synopsis and synopsis_lines:
@@ -1727,17 +1795,16 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
         out.extend(syn_out)
 
     result = '\n'.join(out)
-    # 合并被拆分的段落（连续非空非特殊行用空格连接）
+    # 合并被拆分的段落（连续非空非特殊行用空格连接）— 段落缓冲区已处理，但保留以防遗漏
     result = _th_merge_paragraphs(result)
     # 清理多余空行
     result = re.sub(r'\n{3,}', '\n\n', result)
-    # 清理 ** ** 之间的空连接
+    # 清理 *** 系列（B→I 转换产生的伪标记）→ 空
+    result = re.sub(r'\*{3,}', '', result)
+    # 清理空 bold：** ** → 空（要求中间有空白，不匹配 **text**）
     result = re.sub(r'\*\*\s+\*\*', '', result)
-    # 清理 * * 之间的空连接
-    result = re.sub(r'\*\s+\*', '', result)
-    # 清理空标记 ** ** → 空
-    result = re.sub(r'\*\*\s*\*\*', '', result)
-    result = re.sub(r'\*\s*\*', '', result)
+    # 清理空 italic：* * → 空（要求中间有空白，不匹配 *text*）
+    result = re.sub(r'(?<!\*)\*\s+\*(?!\*)', '', result)
     return result.strip() + '\n'
 
 
@@ -1801,77 +1868,160 @@ def _th_format_synopsis(lines: List[str], display_name: str, section: int,
                         xref: CrossRefDB) -> List[str]:
     """格式化 .TH 格式的 SYNOPSIS 章节。
 
-    .B cmd
-    [
-    .B \-options
-    ] [
-    .B \-l
-    <block|pass|nomatch>
-    ]
-
-    合并为单行反引号包裹的命令行。
+    支持两种 SYNOPSIS 风格：
+    1. 简单命令行（如 ipf.8）：.B cmd [.B -opt] [<arg>] → 合并为单行反引号
+    2. 复杂函数签名（如 jemalloc.3）：含 .nf/.fi 代码块、.SS 子章节、.HP+.BI 函数签名
     """
-    parts: List[str] = []
+    out: List[str] = []
+    # 先检测是否为复杂 SYNOPSIS（含 .nf/.fi 或 .HP 或 .SS）
+    has_nf = any(l.strip().startswith('.nf') for l in lines)
+    has_hp = any(l.strip().startswith('.HP') for l in lines)
+    has_ss = any(l.strip().startswith('.SS') for l in lines)
+    is_complex = has_nf or has_hp or has_ss
+
+    if not is_complex:
+        # 简单命令行 SYNOPSIS：合并为单行反引号
+        parts: List[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # 处理宏行
+            m = re.match(r'^\.(B|I|BR|BI|IR|RB|RI|IB|SB|SM)\b\s*(.*)$', stripped)
+            if m:
+                macro = m.group(1)
+                rest = m.group(2)
+                if macro in ('B', 'SB'):
+                    content = th_clean_escapes(rest)
+                    content = th_process_font_markup(content)
+                    content = re.sub(r'\*\*([^*]+)\*\*', r'\1', content)
+                    content = re.sub(r'\*([^*]+)\*', r'\1', content)
+                    parts.append(content)
+                elif macro in ('I', 'SM'):
+                    content = th_clean_escapes(rest)
+                    content = th_process_font_markup(content)
+                    content = re.sub(r'\*\*([^*]+)\*\*', r'\1', content)
+                    content = re.sub(r'\*([^*]+)\*', r'\1', content)
+                    parts.append(content)
+                else:
+                    _, args = th_split_macro_args(stripped)
+                    if args:
+                        formatted = th_format_alternating(macro, args)
+                        formatted = re.sub(r'\*\*([^*]+)\*\*', r'\1', formatted)
+                        formatted = re.sub(r'\*([^*]+)\*', r'\1', formatted)
+                        parts.append(formatted)
+                continue
+            # 跳过的宏
+            if stripped.startswith('.nf') or stripped.startswith('.fi'):
+                continue
+            if stripped.startswith('.PP') or stripped == '.br' or stripped == '.sp':
+                continue
+            if stripped.startswith('.ft'):
+                continue
+            # 普通文本行
+            content = th_clean_escapes(stripped)
+            content = th_process_font_markup(content)
+            content = re.sub(r'\*\*([^*]+)\*\*', r'\1', content)
+            content = re.sub(r'\*([^*]+)\*', r'\1', content)
+            if content:
+                parts.append(content)
+
+        merged = ' '.join(parts)
+        merged = re.sub(r'\s+', ' ', merged).strip()
+        merged = re.sub(r'\[\s+', '[', merged)
+        merged = re.sub(r'\s+\]', ']', merged)
+        merged = re.sub(r'<\s+', '<', merged)
+        merged = re.sub(r'\s+>', '>', merged)
+        if merged:
+            out.append(f'`{merged}`')
+            out.append('')
+        return out
+
+    # 复杂 SYNOPSIS：逐行处理，保留结构
+    in_nf = False
+    nf_lines: List[str] = []
     for line in lines:
         stripped = line.strip()
         if not stripped:
             continue
-        # 处理宏行
+
+        # .nf — 开始代码块
+        if stripped == '.nf' or stripped.startswith('.nf '):
+            in_nf = True
+            continue
+        # .fi — 结束代码块
+        if stripped == '.fi' or stripped.startswith('.fi '):
+            if in_nf and nf_lines:
+                out.append('```c')
+                for nl in nf_lines:
+                    out.append(nl)
+                out.append('```')
+                out.append('')
+                nf_lines.clear()
+            in_nf = False
+            continue
+        # 代码块内
+        if in_nf:
+            content = th_clean_escapes(stripped)
+            content = th_strip_font_markup(content)
+            if content:
+                nf_lines.append(content)
+            continue
+
+        # .SS — 子章节
+        if stripped.startswith('.SS'):
+            sub_name = stripped[3:].strip().strip('"').strip("'")
+            sub_name = th_clean_escapes(sub_name)
+            sub_name = re.sub(r'\s+', ' ', sub_name).strip()
+            out.append(f'### {sub_name}')
+            out.append('')
+            continue
+
+        # .HP — 悬挂缩进（函数签名前），跳过
+        if stripped.startswith('.HP'):
+            continue
+
+        # .ft — 字体变化，跳过
+        if stripped.startswith('.ft'):
+            continue
+
+        # .sp / .PP — 段落分隔，跳过
+        if stripped.startswith('.sp') or stripped.startswith('.PP'):
+            continue
+
+        # .B / .I / .BR / .BI 等 — 字体宏（函数签名）
         m = re.match(r'^\.(B|I|BR|BI|IR|RB|RI|IB|SB|SM)\b\s*(.*)$', stripped)
         if m:
             macro = m.group(1)
             rest = m.group(2)
-            if macro in ('B', 'SB'):
-                content = th_clean_escapes(rest)
-                content = th_process_font_markup(content)
-                # 去除 ** 标记，保留纯文本
-                content = re.sub(r'\*\*([^*]+)\*\*', r'\1', content)
-                content = re.sub(r'\*([^*]+)\*', r'\1', content)
-                parts.append(content)
-            elif macro in ('I', 'SM'):
+            if macro in ('B', 'SB', 'I', 'SM'):
                 content = th_clean_escapes(rest)
                 content = th_process_font_markup(content)
                 content = re.sub(r'\*\*([^*]+)\*\*', r'\1', content)
                 content = re.sub(r'\*([^*]+)\*', r'\1', content)
-                parts.append(content)
             else:
                 _, args = th_split_macro_args(stripped)
                 if args:
                     formatted = th_format_alternating(macro, args)
-                    # 去除标记
                     formatted = re.sub(r'\*\*([^*]+)\*\*', r'\1', formatted)
                     formatted = re.sub(r'\*([^*]+)\*', r'\1', formatted)
-                    parts.append(formatted)
+                    content = formatted
+                else:
+                    content = ''
+            if content:
+                out.append(f'`{content}`')
+                out.append('')
             continue
-        # 跳过的宏
-        if stripped.startswith('.nf') or stripped.startswith('.fi'):
-            continue
-        if stripped.startswith('.PP') or stripped == '.br' or stripped == '.sp':
-            continue
-        # 普通文本行
+
+        # 普通文本行（如 const char *malloc_conf;）
         content = th_clean_escapes(stripped)
         content = th_process_font_markup(content)
-        # 去除标记
         content = re.sub(r'\*\*([^*]+)\*\*', r'\1', content)
         content = re.sub(r'\*([^*]+)\*', r'\1', content)
         if content:
-            parts.append(content)
+            out.append(f'`{content}`')
+            out.append('')
 
-    # 合并所有部分为单行
-    merged = ' '.join(parts)
-    # 压缩多空格
-    merged = re.sub(r'\s+', ' ', merged).strip()
-    # 修复 [ -opt ] → [-opt]
-    merged = re.sub(r'\[\s+', '[', merged)
-    merged = re.sub(r'\s+\]', ']', merged)
-    # 修复 < file > → <file>
-    merged = re.sub(r'<\s+', '<', merged)
-    merged = re.sub(r'\s+>', '>', merged)
-
-    out: List[str] = []
-    if merged:
-        out.append(f'`{merged}`')
-        out.append('')
     return out
 
 
