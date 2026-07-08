@@ -1948,8 +1948,8 @@ def _th_format_synopsis(lines: List[str], display_name: str, section: int,
         text = re.sub(r'_([^_]+)_', r'\1', text)
         return text
     out: List[str] = []
-    # 先检测是否为复杂 SYNOPSIS（含 .nf/.fi 或 .HP 或 .SS）
-    has_nf = any(l.strip().startswith('.nf') for l in lines)
+    # 先检测是否为复杂 SYNOPSIS（含 .nf/.fi/.Vb/.Ve 或 .HP 或 .SS）
+    has_nf = any(l.strip().startswith('.nf') or l.strip().startswith('.Vb') for l in lines)
     has_hp = any(l.strip().startswith('.HP') for l in lines)
     has_ss = any(l.strip().startswith('.SS') for l in lines)
     is_complex = has_nf or has_hp or has_ss
