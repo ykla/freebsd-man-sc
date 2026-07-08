@@ -560,8 +560,9 @@ def post_process(md: str, display_name: str, section: int,
             # 清理转义字符
             line = clean_mandoc_escapes(line)
             # 去除 > 引用块前缀（mandoc 用 > 包裹 .It 列表项内容）
-            # "> text" → "text"
-            line = re.sub(r'^>\s?', '', line)
+            # 可能有多层嵌套引用（> > text），循环去除所有 > 前缀
+            while re.match(r'^>\s?', line):
+                line = re.sub(r'^>\s?', '', line)
             # 路径斜体改加粗：*/path* → **/path**
             # 匹配 *...* 其中包含 / 的（路径）
             line = re.sub(r'\*([^\*]*/[^\*]*)\*', r'**\1**', line)
@@ -656,6 +657,9 @@ def is_block_boundary(line: str, lines: Optional[List[str]] = None, idx: int = -
     if m:
         tag = m.group(1)
         rest = m.group(2).strip()
+        # rest 全是标点（如 , . ; :)→ 段落内联标记，不是边界
+        if rest and re.match(r'^[.,;:!?)]+$', rest):
+            return False
         # 标签后跟参数（如 **file** *path*）→ 边界
         if rest:
             return True
