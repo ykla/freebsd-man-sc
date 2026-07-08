@@ -2360,6 +2360,7 @@ def _tbl_to_markdown(tbl_lines: List[str]) -> str:
     # 处理合并后的数据行，提取单元格和水平线
     rows: List[List[str]] = []
     raw_rows: List[str] = []
+    num_cols = len(alignments)
     for line in data_lines:
         stripped = line.strip()
         if stripped in ('_', '='):
@@ -2369,9 +2370,10 @@ def _tbl_to_markdown(tbl_lines: List[str]) -> str:
 
         # 分割单元格
         cells = line.split(tab_sep)
-        # 去除首尾空单元格（tbl 数据行可能以 tab 开头/结尾）
-        while cells and cells[0] == '':
-            cells.pop(0)
+        # 如果数据单元格数多于列数，取后 num_cols 个（忽略前导 tab 缩进）
+        if len(cells) > num_cols:
+            cells = cells[-num_cols:]
+        # 去除尾随空单元格
         while cells and cells[-1] == '':
             cells.pop()
         rows.append(cells)
