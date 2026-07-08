@@ -1604,7 +1604,9 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
         if stripped.startswith('.INDENT') or stripped.startswith('.UNINDENT'):
             continue
         if stripped == '.sp' or stripped == '.sp 1' or stripped.startswith('.sp '):
-            if not in_code_block and not in_synopsis:
+            if in_synopsis:
+                synopsis_lines.append(line)
+            elif not in_code_block:
                 flush_para()
                 out.append("")
             continue
@@ -1612,7 +1614,7 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
         # .nf — 开始代码块
         if stripped == '.nf' or stripped.startswith('.nf '):
             if in_synopsis:
-                pass  # synopsis 内不嵌套代码块
+                synopsis_lines.append(line)
             else:
                 flush_para()
                 in_code_block = True
@@ -1625,6 +1627,8 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
                 out.append("```")
                 out.append("")
                 in_code_block = False
+            if in_synopsis:
+                synopsis_lines.append(line)
             continue
 
         # 代码块内：直接输出（清理转义 + 移除字体标记）
