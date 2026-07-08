@@ -375,6 +375,11 @@ def clean_mandoc_escapes(text: str) -> str:
     text = text.replace(r'\[', '[').replace(r'\]', ']')
     # &nbsp; → 空格
     text = text.replace('&nbsp;', ' ')
+    # &#160; → 空格（不间断空格的数字实体）
+    text = text.replace('&#160;', ' ')
+    # &gt; → >, &lt; → <, &amp; → &, &quot; → "
+    text = text.replace('&gt;', '>').replace('&lt;', '<')
+    text = text.replace('&amp;', '&').replace('&quot;', '"')
     # \_ → _ （转义下划线还原）
     text = text.replace(r'\_', '_')
     # \* → * （转义星号还原）
@@ -485,10 +490,11 @@ def post_process(md: str, display_name: str, section: int,
     2. 降级标题层级（# → ##，## → ###）
     3. 清理转义字符（\\[, \\], &nbsp;, \\_, \\*）
     4. SYNOPSIS 章节合并为代码块（反引号包裹的命令行）
-    5. 路径斜体改为加粗（*/path* → **/path**）
-    6. 交叉引用 name(N) 链接化
-    7. 去除页脚行
-    8. 合并断行的内联标记（**cmd**\\n → **cmd** ）
+    5. 去除 > 引用块前缀（mandoc 用 > 包裹 .It 列表项内容）
+    6. 合并被拆分的段落（mandoc 把每个内联宏单独成行）
+    7. 路径斜体改为加粗（*/path* → **/path**）
+    8. 交叉引用 name(N) 链接化
+    9. 去除页脚行
     """
     lines = md.splitlines()
     out: List[str] = []
@@ -553,6 +559,9 @@ def post_process(md: str, display_name: str, section: int,
         if not in_code_block:
             # 清理转义字符
             line = clean_mandoc_escapes(line)
+            # 去除 > 引用块前缀（mandoc 用 > 包裹 .It 列表项内容）
+            # "> text" → "text"
+            line = re.sub(r'^>\s?', '', line)
             # 路径斜体改加粗：*/path* → **/path**
             # 匹配 *...* 其中包含 / 的（路径）
             line = re.sub(r'\*([^\*]*/[^\*]*)\*', r'**\1**', line)
@@ -564,8 +573,9 @@ def post_process(md: str, display_name: str, section: int,
 
     result = "\n".join(out)
     # 合并有序列表的断行续行：如 "1.\tFreeBSD\n\tGeneral Commands Manual"
-    # mandoc 输出格式：行尾为 \t 分隔，续行用 \t 缩进
     result = merge_list_continuations(result)
+    # 合并被拆分的段落（mandoc 把每个内联宏单独成行）
+    result = merge_broken_paragraphs(result)
     # 清理多余空行
     result = re.sub(r'\n{3,}', '\n\n', result)
     return result.strip() + "\n"
@@ -610,6 +620,132 @@ def merge_list_continuations(text: str) -> str:
             continue
         out.append(line)
         i += 1
+    return '\n'.join(out)
+
+
+def is_block_boundary(line: str, lines: Optional[List[str]] = None, idx: int = -1) -> bool:
+    """判断一行是否是段落边界（不应合并的行）。
+    lines/idx 用于判断标签列表项后是否跟空行。
+    """
+    s = line.strip()
+    if not s:
+        return True
+    # 标题
+    if s.startswith('#'):
+        return True
+    # 代码块围栏
+    if s.startswith('```'):
+        return True
+    # 列表项
+    if re.match(r'^(\d+\.|-|\*)\s', s):
+        return True
+    # 缩进代码块（4+ 空格或 tab）
+    if line.startswith('    ') or line.startswith('\t'):
+        return True
+    # 表格行
+    if s.startswith('|'):
+        return True
+    # HTML 标签
+    if s.startswith('<'):
+        return True
+    # 水平分隔线
+    if re.match(r'^(-{3,}|\*{3,})$', s):
+        return True
+    # 标签列表项：**-K** 或 **--opt** 这种以 ** 开头且紧跟非字母数字
+    m = re.match(r'^\*\*([^*]+)\*\*(.*)$', s)
+    if m:
+        tag = m.group(1)
+        rest = m.group(2).strip()
+        # 标签后跟参数（如 **file** *path*）→ 边界
+        if rest:
+            return True
+        # 单独的 **-X** 或 **word** 行：检查后是否跟空行
+        # 后跟空行 → 独立标签列表项（边界）
+        # 后跟非空行 → 段落中的内联标记（不边界，合并）
+        if lines is not None and idx >= 0 and idx + 1 < len(lines):
+            next_s = lines[idx + 1].strip()
+            if next_s == '':
+                return True
+            return False
+        # 无上下文信息，保守视为边界
+        return True
+    # 环境变量标签：`VAR` 单独成行
+    # 只有当后跟空行时才是标签列表项（边界）
+    # 段落中间的 `VAR` 单独成行（后无空行）不是边界
+    m2 = re.match(r'^`([^`]+)`(.*)$', s)
+    if m2:
+        rest = m2.group(2).strip()
+        if not rest:
+            # 单独成行：检查下一行是否为空
+            if lines is not None and idx >= 0 and idx + 1 < len(lines):
+                next_s = lines[idx + 1].strip()
+                if next_s == '':
+                    return True
+                return False
+            # 无上下文信息，保守视为边界
+            return True
+    return False
+
+
+def should_join_with_prev(line: str, prev_line: str) -> bool:
+    """判断当前行是否应与前一行合并为同一段落。"""
+    s = line.strip()
+    p = prev_line.strip()
+    if not s or not p:
+        return False
+    # 边界行不合并
+    if is_block_boundary(line) or is_block_boundary(prev_line):
+        return False
+    return True
+
+
+def merge_broken_paragraphs(text: str) -> str:
+    """合并被 mandoc 拆分的段落。
+
+    mandoc 把每个内联宏（.Nm, .Ar, .Fl 等）单独成行，
+    需要将它们合并回完整段落。所有同一非空块内的行用空格连接。
+    """
+    lines = text.split('\n')
+    out: List[str] = []
+    para: List[str] = []  # 当前段落的行
+
+    def flush_para():
+        if not para:
+            return
+        # 所有行用空格连接
+        parts = [ln.strip() for ln in para if ln.strip()]
+        merged = ' '.join(parts)
+        # 压缩多空格
+        merged = re.sub(r' {2,}', ' ', merged)
+        out.append(merged)
+        para.clear()
+
+    in_code = False
+    for i, line in enumerate(lines):
+        s = line.strip()
+        # 代码块状态
+        if s.startswith('```'):
+            flush_para()
+            in_code = not in_code
+            out.append(line)
+            continue
+        if in_code:
+            out.append(line)
+            continue
+        # 空行：段落结束
+        if not s:
+            flush_para()
+            out.append('')
+            continue
+        # 边界行：段落结束，边界行单独输出
+        if is_block_boundary(line, lines, i):
+            flush_para()
+            out.append(line)
+            continue
+        # 普通行：加入当前段落
+        para.append(line)
+
+    flush_para()
     return '\n'.join(out)
 
 
