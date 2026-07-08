@@ -813,8 +813,8 @@ def post_process(md: str, display_name: str, section: int,
             # .Cd 宏输出 **device xxx** → `device xxx`（内核配置声明用反引号）
             line = re.sub(r'\*\*(device\s+\S+)\*\*', r'`\1`', line)
             # 路径斜体改加粗：*/path* → **/path**
-            # 匹配 *...* 其中包含 / 的（路径）
-            line = re.sub(r'\*([^\*]*/[^\*]*)\*', r'**\1**', line)
+            # 匹配 *...* 其中包含 / 的（路径），要求内容不含空格（避免误匹配运算符列表如 * / % ^*）
+            line = re.sub(r'\*([^\*\s]*/[^\*\s]*)\*', r'**\1**', line)
             # 交叉引用链接化
             line = linkify_xref(line, section, xref)
 
