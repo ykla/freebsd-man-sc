@@ -2324,14 +2324,26 @@ def _tbl_to_markdown(tbl_lines: List[str]) -> str:
             if 'T{' in line.split(tab_sep):
                 in_text = True
                 text_parts = [line]
+            elif stripped in ('_', '='):
+                merged_lines.append(stripped)  # 保留水平线
             else:
                 merged_lines.append(line)
         else:
+            # 文本块内遇到 _ 或 =：结束文本块，保留水平线
+            if stripped in ('_', '='):
+                in_text = False
+                merged_lines.append(_merge_text_block(text_parts))
+                merged_lines.append(stripped)
+                text_parts = []
+                continue
             text_parts.append(line)
             # 检查是否包含 T}（文本块结束）
-            if 'T}' in line.split(tab_sep):
+            # 只有当行中有 T} 且没有 T{ 时才结束（避免跨 cell 的 T{...T}）
+            cells_in_line = line.split(tab_sep)
+            has_t_end = 'T}' in cells_in_line
+            has_t_start = 'T{' in cells_in_line
+            if has_t_end and not has_t_start:
                 in_text = False
-                # 合并 text block 内容
                 merged_lines.append(_merge_text_block(text_parts))
                 text_parts = []
 
