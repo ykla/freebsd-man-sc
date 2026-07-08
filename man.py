@@ -1315,10 +1315,18 @@ def th_clean_escapes(text: str) -> str:
     text = text.replace(r'\(lq', '"')
     # \(rq → "（右引号）
     text = text.replace(r'\(rq', '"')
+    # \(dq → "（双引号）
+    text = text.replace(r'\(dq', '"')
     # \(em → —（破折号）
     text = text.replace(r'\(em', '—')
     # \(en → –（短破折号）
     text = text.replace(r'\(en', '–')
+    # \(bu → •（项目符号）
+    text = text.replace(r'\(bu', '•')
+    # \(aa → ´（锐音符）
+    text = text.replace(r'\(aa', '´')
+    # \(ga → `（重音符）
+    text = text.replace(r'\(ga', '`')
     # \*(Aq → '
     text = text.replace(r'\*(Aq', "'")
     # \m[blue] \m[] — 颜色标记（跳过）
@@ -1327,6 +1335,8 @@ def th_clean_escapes(text: str) -> str:
     text = re.sub(r'\\s[+-]?\d+', '', text)
     # \u \d — 上标/下标（跳过）
     text = text.replace(r'\u', '').replace(r'\d', '')
+    # \w'...' — 宽度指令（跳过）
+    text = re.sub(r"\\w'[^']*'", '', text)
     # \[charNN] — Unicode 字符引用（跳过）
     text = re.sub(r'\\\[[^\]]*\]', '', text)
     return text
