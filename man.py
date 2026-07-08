@@ -1423,7 +1423,7 @@ def th_strip_font_markup(text: str) -> str:
 def th_split_macro_args(line: str) -> Tuple[str, List[str]]:
     """分割 .TH 宏行为 (宏名, [参数])。
 
-    如 .BR \-F <number> → ('BR', ['-F', '<number>'])
+    如 .BR \\-F <number> → ('BR', ['-F', '<number>'])
     如 .B ipf → ('B', ['ipf'])
     """
     # 去除前导 .
