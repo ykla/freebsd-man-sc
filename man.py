@@ -1799,12 +1799,12 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
     result = _th_merge_paragraphs(result)
     # 清理多余空行
     result = re.sub(r'\n{3,}', '\n\n', result)
-    # 清理 *** 系列（B→I 转换产生的伪标记）→ 空
-    result = re.sub(r'\*{3,}', '', result)
     # 清理空 bold：** ** → 空（要求中间有空白，不匹配 **text**）
     result = re.sub(r'\*\*\s+\*\*', '', result)
-    # 清理空 italic：* * → 空（要求中间有空白，不匹配 *text*）
-    result = re.sub(r'(?<!\*)\*\s+\*(?!\*)', '', result)
+    # 清理空 italic：_ _ → 空（要求中间有空白，不匹配 _text_）
+    result = re.sub(r'(?<!_)_\s+_(?!_)', '', result)
+    # 清理 **** 系列（重复 bold 开关）→ 空
+    result = re.sub(r'\*{4,}', '', result)
     return result.strip() + '\n'
 
 
