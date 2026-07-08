@@ -1345,44 +1345,47 @@ def th_clean_escapes(text: str) -> str:
 def th_process_font_markup(text: str) -> str:
     """处理 .TH 格式的内联字体标记 \\fB \\fI \\fR \\fP。
 
-    \\fB...\\fP → **...**
-    \\fI...\\fP → *...*
-    \\fR \\fP → 关闭当前标记
+    man 格式的字体切换是顺序的（非嵌套）：
+    \\fB 设置当前字体为加粗
+    \\fI 设置当前字体为斜体
+    \\fR 设置当前字体为 roman（常规）
+    \\fP 返回上一字体
     """
-    # \fB → 开启加粗
-    # \fI → 开启斜体
-    # \fR → 关闭标记
-    # \fP → 关闭标记（返回上一字体）
     result: List[str] = []
-    font_stack: List[str] = []  # 'B' or 'I'
+    current_font = 'R'  # R=roman, B=bold, I=italic
+    prev_font = 'R'
     i = 0
     n = len(text)
     while i < n:
-        if text[i] == '\\' and i + 1 < n and text[i + 1] == 'f':
-            if i + 2 < n:
-                font = text[i + 2]
-                if font == 'B':
-                    font_stack.append('B')
+        if text[i] == '\\' and i + 1 < n and text[i + 1] == 'f' and i + 2 < n:
+            font = text[i + 2]
+            if font in ('B', 'I', 'R', 'P'):
+                new_font = font
+                if font == 'P':
+                    new_font = prev_font
+                # 关闭当前字体标记
+                if current_font == 'B':
                     result.append('**')
-                    i += 3
-                    continue
-                elif font == 'I':
-                    font_stack.append('I')
+                elif current_font == 'I':
                     result.append('*')
-                    i += 3
-                    continue
-                elif font in ('R', 'P'):
-                    if font_stack:
-                        f = font_stack.pop()
-                        result.append('**' if f == 'B' else '*')
-                    i += 3
-                    continue
+                # 切换字体
+                if font != 'P':
+                    prev_font = current_font
+                current_font = new_font
+                # 开启新字体标记
+                if current_font == 'B':
+                    result.append('**')
+                elif current_font == 'I':
+                    result.append('*')
+                i += 3
+                continue
         result.append(text[i])
         i += 1
     # 关闭未闭合的标记
-    while font_stack:
-        f = font_stack.pop()
-        result.append('**' if f == 'B' else '*')
+    if current_font == 'B':
+        result.append('**')
+    elif current_font == 'I':
+        result.append('*')
     return ''.join(result)
 
 
@@ -1523,20 +1526,24 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
                 out.append("")
             continue
 
+        # 跳过孤立的 . 行（rst2man 等生成的空宏行）
+        if stripped == '.':
+            continue
+
         # .TH 行
         if stripped.startswith('.TH'):
             _, _, date = parse_th_line(stripped)
             continue
 
         # 跳过的 roff 控制宏
-        if re.match(r'^\.(nr|ds|ie|el|nh|ad|ft|in|ti|ta|ll|po|pl|ne|hy|IX|rs|re)\b', stripped) or \
-           re.match(r'^\.(nr|ds|ie|el|nh|ad|ft|in|ti|ta|ll|po|pl|ne|hy|IX|rs|re)$', stripped):
+        if re.match(r'^\.(nr|ds|ie|el|nh|ad|ft|in|ti|ta|ll|po|pl|ne|hy|IX|rs|re|HP|cw|ps|cs)\b', stripped) or \
+           re.match(r'^\.(nr|ds|ie|el|nh|ad|ft|in|ti|ta|ll|po|pl|ne|hy|IX|rs|re|HP|cw|ps|cs)$', stripped):
             continue
         if stripped == '.DT':
             continue
         if stripped.startswith('.INDENT') or stripped.startswith('.UNINDENT'):
             continue
-        if stripped == '.sp' or stripped == '.sp 1':
+        if stripped == '.sp' or stripped == '.sp 1' or stripped.startswith('.sp '):
             if not in_code_block and not in_synopsis:
                 out.append("")
             continue
@@ -1586,6 +1593,14 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
 
         # .SH — 章节标题
         if stripped.startswith('.SH'):
+            # 如果在 SYNOPSIS 中，先输出收集的 synopsis
+            if in_synopsis:
+                in_synopsis = False
+                if synopsis_lines:
+                    syn_out = _th_format_synopsis(synopsis_lines, display_name, section, xref)
+                    out.extend(syn_out)
+                    synopsis_lines = []
+
             # 提取章节名
             sec_name = stripped[3:].strip()
             # 去除引号
@@ -1602,8 +1617,6 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
                 out.append("")
                 continue
 
-            in_synopsis = False  # 退出 SYNOPSIS
-
             # 翻译章节标题
             cn_name = TH_SECTION_MAP.get(current_section, sec_name)
             out.append(f"## {cn_name}")
@@ -1612,32 +1625,48 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
 
         # .SS — 子章节标题
         if stripped.startswith('.SS'):
+            # 如果在 SYNOPSIS 中，先输出
+            if in_synopsis:
+                in_synopsis = False
+                if synopsis_lines:
+                    syn_out = _th_format_synopsis(synopsis_lines, display_name, section, xref)
+                    out.extend(syn_out)
+                    synopsis_lines = []
+
             sub_name = stripped[3:].strip().strip('"').strip("'")
             sub_name = re.sub(r'\s+', ' ', sub_name)
-            in_synopsis = False  # 退出 SYNOPSIS
             out.append(f"### {sub_name}")
             out.append("")
             continue
 
         # .TP — 标签段落（下一行是标签）
         if stripped == '.TP' or stripped.startswith('.TP '):
-            pending_tp = True
+            # 如果在 SYNOPSIS 中，先输出
             if in_synopsis:
-                in_synopsis = False  # SYNOPSIS 内遇到 .TP 表示结束
-                # 输出收集的 synopsis
-                syn_out = _th_format_synopsis(synopsis_lines, display_name, section, xref)
-                out.extend(syn_out)
-                synopsis_lines = []
+                in_synopsis = False
+                if synopsis_lines:
+                    syn_out = _th_format_synopsis(synopsis_lines, display_name, section, xref)
+                    out.extend(syn_out)
+                    synopsis_lines = []
+            pending_tp = True
             continue
 
         # .IP — 缩进段落
         if stripped.startswith('.IP'):
+            # 如果在 SYNOPSIS 中，先输出
+            if in_synopsis:
+                in_synopsis = False
+                if synopsis_lines:
+                    syn_out = _th_format_synopsis(synopsis_lines, display_name, section, xref)
+                    out.extend(syn_out)
+                    synopsis_lines = []
             # .IP 类似 .TP，但标签在同行的参数中
             _, args = th_split_macro_args(stripped)
             if args:
                 tag = th_clean_escapes(args[0])
                 tag = th_process_font_markup(tag)
                 out.append(f"- {tag}")
+                pending_ip_desc = True
             continue
 
         # SYNOPSIS 章节：收集所有行
