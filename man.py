@@ -577,6 +577,8 @@ def post_process(md: str, display_name: str, section: int,
     result = merge_list_continuations(result)
     # 合并被拆分的段落（mandoc 把每个内联宏单独成行）
     result = merge_broken_paragraphs(result)
+    # 将连续的 **标签**\n\n描述 模式转换为无序列表（嵌套子选项）
+    result = convert_tag_desc_to_list(result)
     # 清理多余空行
     result = re.sub(r'\n{3,}', '\n\n', result)
     return result.strip() + "\n"
@@ -750,6 +752,101 @@ def merge_broken_paragraphs(text: str) -> str:
         para.append(line)
 
     flush_para()
+    return '\n'.join(out)
+
+
+def convert_tag_desc_to_list(text: str) -> str:
+    """将连续的 **标签**\n\n描述 模式转换为无序列表。
+
+    mandoc 嵌套标签列表输出为：
+        **e**
+
+        eqn(1) (description)
+
+        **p**
+
+        pic(1) (description)
+
+    转换为：
+        - **e** eqn(1) (description)
+        - **p** pic(1) (description)
+
+    仅当连续出现 2 个以上 **标签**+描述 时才转换（避免误判段落中的加粗词）。
+    """
+    lines = text.split('\n')
+    out: List[str] = []
+    i = 0
+    n = len(lines)
+
+    # 匹配纯标签行：**xxx** 或 **-x** 或 **--xxx**，后无其他内容
+    tag_re = re.compile(r'^\*\*([^*]+)\*\*$')
+
+    while i < n:
+        # 尝试检测连续的 标签+空行+描述+空行 模式
+        # 仅转换不以 - 开头的短标签（子选项），保留 **-X** 顶级选项不变
+        first_m = tag_re.match(lines[i].strip())
+        if not first_m or first_m.group(1).startswith('-'):
+            out.append(lines[i])
+            i += 1
+            continue
+
+        # 先扫描连续的标签块（所有标签都不以 - 开头）
+        tag_blocks: List[Tuple[str, str, int]] = []  # (tag, desc, start_line)
+        j = i
+        while j < n:
+            m = tag_re.match(lines[j].strip())
+            if not m:
+                break
+            tag = m.group(1)
+            # 带 - 的选项标签不参与子选项列表
+            if tag.startswith('-'):
+                break
+            # 查找描述：跳过空行，找下一个非空行（直到下一个标签或空行）
+            k = j + 1
+            # 跳过一个空行
+            if k < n and lines[k].strip() == '':
+                k += 1
+            # 收集描述行（直到空行或标签）
+            desc_parts: List[str] = []
+            while k < n:
+                ls = lines[k].strip()
+                if ls == '':
+                    break
+                if tag_re.match(ls):
+                    break
+                desc_parts.append(ls)
+                k += 1
+            desc = ' '.join(desc_parts)
+            if not desc:
+                break
+            tag_blocks.append((tag, desc, j))
+            # 移动到描述结束位置
+            j = k
+            # 跳过空行到下一个标签
+            while j < n and lines[j].strip() == '':
+                j += 1
+
+        # 只有连续 2 个以上标签+描述才转换为列表
+        if len(tag_blocks) >= 2:
+            for tag, desc, _ in tag_blocks:
+                out.append(f"- **{tag}** {desc}")
+            out.append("")
+            i = j
+            continue
+
+        # 单个标签+描述：保持原样
+        if tag_blocks:
+            for tag, desc, _ in tag_blocks:
+                out.append(f"**{tag}**")
+                out.append("")
+                out.append(desc)
+                out.append("")
+            i = j
+            continue
+
+        out.append(lines[i])
+        i += 1
+
     return '\n'.join(out)
 
 
