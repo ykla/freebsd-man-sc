@@ -2288,9 +2288,13 @@ def _tbl_to_markdown(tbl_lines: List[str]) -> str:
         half = len(all_specs) // 2
         first_half = all_specs[:half]
         second_half = all_specs[half:]
-        has_modifiers = any('B' in s or 'b' in s or 'I' in s or 'i' in s for s in first_half)
-        has_align = any(s.startswith(('l', 'r', 'c', 'n', 'a', 's', '^')) for s in second_half)
-        if has_modifiers and has_align:
+        has_modifiers = all('B' in s or 'b' in s or 'I' in s or 'i' in s for s in first_half)
+        # 后半必须全是纯对齐（l, r, c, n, a, s, ^），不含任何修饰符，才确认为两行格式
+        is_align_only = all(
+            re.match(r'^[lrcnas^]+$', re.sub(r'[|]', '', s))
+            for s in second_half
+        )
+        if has_modifiers and is_align_only:
             col_specs = second_half
         else:
             col_specs = all_specs
