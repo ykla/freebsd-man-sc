@@ -1694,13 +1694,11 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
 
         # .SS — 子章节标题
         if stripped.startswith('.SS'):
-            # 如果在 SYNOPSIS 中，先输出
+            # 如果在 SYNOPSIS 中，不加 flush，将 .SS 加入 synopsis_lines
+            # （jemalloc.3 等文件 SYNOPSIS 内含 .SS 子章节）
             if in_synopsis:
-                in_synopsis = False
-                if synopsis_lines:
-                    syn_out = _th_format_synopsis(synopsis_lines, display_name, section, xref)
-                    out.extend(syn_out)
-                    synopsis_lines = []
+                synopsis_lines.append(line)
+                continue
 
             flush_para()
             sub_name = stripped[3:].strip().strip('"').strip("'")
@@ -1712,26 +1710,20 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
 
         # .TP — 标签段落（下一行是标签）
         if stripped == '.TP' or stripped.startswith('.TP '):
-            # 如果在 SYNOPSIS 中，先输出
+            # 如果在 SYNOPSIS 中，加入 synopsis_lines
             if in_synopsis:
-                in_synopsis = False
-                if synopsis_lines:
-                    syn_out = _th_format_synopsis(synopsis_lines, display_name, section, xref)
-                    out.extend(syn_out)
-                    synopsis_lines = []
+                synopsis_lines.append(line)
+                continue
             flush_para()
             pending_tp = True
             continue
 
         # .IP — 缩进段落
         if stripped.startswith('.IP'):
-            # 如果在 SYNOPSIS 中，先输出
+            # 如果在 SYNOPSIS 中，加入 synopsis_lines
             if in_synopsis:
-                in_synopsis = False
-                if synopsis_lines:
-                    syn_out = _th_format_synopsis(synopsis_lines, display_name, section, xref)
-                    out.extend(syn_out)
-                    synopsis_lines = []
+                synopsis_lines.append(line)
+                continue
             flush_para()
             # .IP 类似 .TP，但标签在同行的参数中
             _, args = th_split_macro_args(stripped)
@@ -1889,6 +1881,9 @@ def _th_format_synopsis(lines: List[str], display_name: str, section: int,
     has_hp = any(l.strip().startswith('.HP') for l in lines)
     has_ss = any(l.strip().startswith('.SS') for l in lines)
     is_complex = has_nf or has_hp or has_ss
+
+    # DEBUG
+    print(f"  [DEBUG _th_format_synopsis] has_nf={has_nf} has_hp={has_hp} has_ss={has_ss} is_complex={is_complex} lines={len(lines)}", file=sys.stderr)
 
     if not is_complex:
         # 简单命令行 SYNOPSIS：合并为单行反引号
