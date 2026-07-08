@@ -1987,7 +1987,7 @@ def _th_format_synopsis(lines: List[str], display_name: str, section: int,
                         parts.append(formatted)
                 continue
             # 跳过的宏
-            if stripped.startswith('.nf') or stripped.startswith('.fi'):
+            if stripped.startswith('.nf') or stripped.startswith('.fi') or stripped.startswith('.Vb') or stripped.startswith('.Ve'):
                 continue
             if stripped.startswith('.PP') or stripped == '.br' or stripped == '.sp':
                 continue
@@ -2037,13 +2037,13 @@ def _th_format_synopsis(lines: List[str], display_name: str, section: int,
         if not stripped:
             continue
 
-        # .nf — 开始代码块
-        if stripped == '.nf' or stripped.startswith('.nf '):
+        # .nf / .Vb — 开始代码块
+        if stripped == '.nf' or stripped.startswith('.nf ') or stripped == '.Vb' or stripped.startswith('.Vb '):
             _flush_sig_block()
             in_nf = True
             continue
-        # .fi — 结束代码块
-        if stripped == '.fi' or stripped.startswith('.fi '):
+        # .fi / .Ve — 结束代码块
+        if stripped == '.fi' or stripped.startswith('.fi ') or stripped == '.Ve' or stripped.startswith('.Ve '):
             if in_nf and nf_lines:
                 out.append('```c')
                 for nl in nf_lines:
