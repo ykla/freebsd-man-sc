@@ -2193,6 +2193,45 @@ def _preprocess_tbl_tables(text: str) -> Tuple[str, Dict[str, str]]:
     return '\n'.join(result_lines), tables
 
 
+def _merge_text_block(lines: List[str]) -> str:
+    """合并 T{...T} 多行文本块为单行。
+
+    将多行 T{...T} 文本块扁平化为单行 tab 分隔的单元格。
+    T{ 开始一个单元格，T} 结束一个单元格，
+    之间的所有文本（可跨多行）拼接为该单元格的内容。
+    """
+    if not lines:
+        return ''
+    result_cells: List[str] = []
+    current_cell: List[str] = []
+    in_cell = False
+
+    for line in lines:
+        cells = line.split('\t')
+        for cell in cells:
+            cell = cell.strip()
+            if cell == 'T{':
+                in_cell = True
+                current_cell = []
+            elif cell == 'T}':
+                if in_cell:
+                    result_cells.append(' '.join(current_cell).strip())
+                    current_cell = []
+                    in_cell = False
+                else:
+                    result_cells.append('')
+            elif in_cell:
+                if cell:
+                    current_cell.append(cell)
+            else:
+                result_cells.append(cell)
+
+    if in_cell:
+        result_cells.append(' '.join(current_cell).strip())
+
+    return '\t'.join(result_cells)
+
+
 def _tbl_to_markdown(tbl_lines: List[str]) -> str:
     """将 tbl 表格行列表转换为 markdown 表格。"""
     # 解析选项和格式说明
