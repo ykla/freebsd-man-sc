@@ -2362,7 +2362,7 @@ def cmd_all() -> None:
                 group = gm.group(1)
 
         try:
-            convert_one(p, out_dir, xref)
+            out_path, display_name, section, date = convert_one(p, out_dir, xref)
             converted += 1
             if converted % 50 == 0:
                 log(f"  已转换 {converted}/{len(files)}...")
@@ -2370,11 +2370,11 @@ def cmd_all() -> None:
             log(f"转换失败 {p}: {e}")
             continue
 
-        rel_path = f"en/man{section}/{safe_filename(name)}.{section}.md"
+        rel_path = f"en/man{section}/{safe_filename(display_name)}.{section}.md"
         summary_entries.append({
-            "section": section, "name": name, "rel_path": rel_path, "group": group
+            "section": section, "name": display_name, "rel_path": rel_path, "group": group
         })
-        dates_data.setdefault(section, []).append((name, date))
+        dates_data.setdefault(section, []).append((display_name, date))
 
     log(f"主文件转换完成：{converted}/{len(files)}")
 
