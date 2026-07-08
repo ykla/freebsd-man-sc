@@ -2270,37 +2270,46 @@ def _tbl_to_markdown(tbl_lines: List[str]) -> str:
     if not alignments:
         return ''
 
-    # 处理数据行
+    # 处理数据行（含 T{...T} 多行文本块）
+    # T{...T} 是 per-cell 的文本块，不是 per-row
+    # 将多行 T{...T} 文本块合并为单行单元格
+    merged_lines: List[str] = []
+    in_text = False
+    text_parts: List[str] = []
+    for line in data_lines:
+        stripped = line.strip()
+        if stripped == '.T&':
+            continue
+        if not in_text:
+            # 检查是否包含 T{（文本块开始）
+            if 'T{' in line.split(tab_sep):
+                in_text = True
+                text_parts = [line]
+            else:
+                merged_lines.append(line)
+        else:
+            text_parts.append(line)
+            # 检查是否包含 T}（文本块结束）
+            if 'T}' in line.split(tab_sep):
+                in_text = False
+                # 合并 text block 内容
+                merged_lines.append(_merge_text_block(text_parts))
+                text_parts = []
+
+    if in_text:
+        # 未闭合的文本块
+        merged_lines.append(_merge_text_block(text_parts))
+
+    data_lines = merged_lines
+
+    # 处理合并后的数据行，提取单元格和水平线
     rows: List[List[str]] = []
     raw_rows: List[str] = []
-    in_text_block = False
-    text_block_content: List[str] = []
-
     for line in data_lines:
-        if in_text_block:
-            if line.strip() == 'T}':
-                in_text_block = False
-                # 合并 text block 内容
-                rows.append(['\n'.join(text_block_content)])
-                text_block_content = []
-            else:
-                text_block_content.append(line)
-            continue
-
-        if line.strip() == 'T{':
-            in_text_block = True
-            text_block_content = []
-            continue
-
-        if line.strip() in ('_', '='):
-            # 水平线——跳过（markdown 表格不支持）
-            # 但如果前一行是数据，标记为表头分隔
+        stripped = line.strip()
+        if stripped in ('_', '='):
             if rows:
                 raw_rows.append('__SEP__')
-            continue
-
-        if line.strip() == '.T&':
-            # 表格续行——跳过格式重新解析
             continue
 
         # 分割单元格
@@ -2316,13 +2325,22 @@ def _tbl_to_markdown(tbl_lines: List[str]) -> str:
         return ''
 
     # 判断第一行是否为表头（如果第一行之后有 __SEP__）
-    has_header = len(raw_rows) > 0 and raw_rows[0] == '__SEP__' if raw_rows else False
+    # 如果没有 __SEP__，将第一行作为表头（tbl 中第一行通常就是表头）
+    has_header = False
+    for sep_idx, raw in enumerate(raw_rows):
+        if raw == '__SEP__':
+            has_header = True
+            break
 
     # 构建 markdown 表格
     md_lines: List[str] = []
 
     # 确定表头行和数据行
     if has_header and len(rows) >= 2:
+        header_row = rows[0]
+        data_rows = rows[1:]
+    elif len(rows) >= 1:
+        # 没有显式分隔符：将第一行作为表头
         header_row = rows[0]
         data_rows = rows[1:]
     else:
