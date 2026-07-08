@@ -1675,8 +1675,8 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
                 out.append("")
             continue
 
-        # .nf — 开始代码块
-        if stripped == '.nf' or stripped.startswith('.nf '):
+        # .nf / .Vb — 开始代码块
+        if stripped == '.nf' or stripped.startswith('.nf ') or stripped == '.Vb' or stripped.startswith('.Vb '):
             if in_synopsis:
                 synopsis_lines.append(line)
             else:
@@ -1685,8 +1685,8 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
                 out.append("```sh")
             continue
 
-        # .fi — 结束代码块
-        if stripped == '.fi' or stripped.startswith('.fi '):
+        # .fi / .Ve — 结束代码块
+        if stripped == '.fi' or stripped.startswith('.fi ') or stripped == '.Ve' or stripped.startswith('.Ve '):
             if in_code_block:
                 out.append("```")
                 out.append("")
