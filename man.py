@@ -780,18 +780,19 @@ def post_process(md: str, display_name: str, section: int,
                 i = next_i
                 continue
             # 其他标题：记录当前章节
-            m = re.match(r'^#+\s+(.+)$', line)
+            m = re.match(r'^(#+)\s+(.+)$', line)
             if m:
-                title = m.group(1)
+                hash_count = len(m.group(1))
+                title = m.group(2)
                 # 去除标题中的反引号包裹（mandoc 有时输出 # `BLUETOOTH_PROTO_HCI protocol`）
                 title = re.sub(r'^`([^`]+)`$', r'\1', title)
                 # 去除标题中的 ** 加粗标记
                 title = re.sub(r'\*\*([^*]+)\*\*', r'\1', title)
+                # 去除标题中的 * 斜体标记
+                title = re.sub(r'\*([^*]+)\*', r'\1', title)
                 current_section_header = title.upper()
-                line = "#" + line.split('#', 1)[0] + " " + title if title else "#" + line
-                # 重建降级标题
-                orig_hash_count = len(line) - len(line.lstrip('#'))
-                line = "#" * (orig_hash_count + 1) + " " + title
+                # 降级：增加一个 #
+                line = "#" * (hash_count + 1) + " " + title
             else:
                 line = "#" + line
 
@@ -930,7 +931,7 @@ def merge_list_continuations(text: str) -> str:
 
 def is_block_boundary(line: str, lines: Optional[List[str]] = None, idx: int = -1) -> bool:
     """判断一行是否是段落边界（不应合并的行）。
-    lines/idx 用于判断标签列表项后是否跟空行。
+    lines/idx 用于判断标签列表项后是否跟空行，以及列表项上下文。
     """
     s = line.strip()
     if not s:
@@ -941,8 +942,24 @@ def is_block_boundary(line: str, lines: Optional[List[str]] = None, idx: int = -
     # 代码块围栏
     if s.startswith('```'):
         return True
-    # 列表项
-    if re.match(r'^(\d+\.|-|\*)\s', s):
+    # 列表项：检测 - 和 * 开头
+    # 但 - 后跟数字（如 "- 1, inclusive."）可能是数学表达式，不是列表项
+    # 仅当前一行为空或也是列表项时才视为边界
+    list_match = re.match(r'^(-|\*)\s(.+)$', s)
+    if list_match:
+        content = list_match.group(2)
+        # - 后跟数字和标点（如 "- 1, inclusive."）→ 可能是数学表达式
+        if re.match(r'^\d+[,.]?\s', content) or re.match(r'^\d+,\s\w', content):
+            # 检查前一行是否为空（段落开始）
+            if lines is not None and idx > 0:
+                prev_s = lines[idx - 1].strip()
+                if prev_s:
+                    # 前一行非空，不是段落开始 → 合并到前一段落
+                    return False
+            return True
+        return True
+    # 有序列表项：N. 开头
+    if re.match(r'^\d+\.\s', s):
         return True
     # 缩进代码块（4+ 空格或 tab）
     if line.startswith('    ') or line.startswith('\t'):
