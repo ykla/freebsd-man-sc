@@ -2228,13 +2228,35 @@ def _tbl_to_markdown(tbl_lines: List[str]) -> str:
         tab_sep = tab_match.group(1)
 
     # 解析格式说明
+    # tbl 支持多行格式：第一行是字体修饰符（b, B, i），第二行是对齐（l, r, c, n）
+    # 使用最后一行（对齐行）来确定列数和对齐方式
     format_str = ' '.join(format_lines)
     # 去除末尾的 .
     if format_str.endswith('.'):
         format_str = format_str[:-1]
 
-    # 分割列说明
-    col_specs = format_str.split()
+    # 如果有多个格式行（用空格连接后），取最后一行作为对齐行
+    # 格式行之间可能有换行，已被 join 变为空格，但列说明符不含空格
+    # 我们直接按空格分割所有格式说明符
+    all_specs = format_str.split()
+    # 如果有多行格式说明，最后一行是对齐行
+    # 找出对齐行：从后往前找，直到找到第一个非 b/B/i/I 修饰符的说明符
+    # 简化处理：取 all_specs 作为列说明符列表，但只取对齐相关的
+    # 对于两行格式（如 "lB lB lB lB r l l l l"），后半部分是对齐
+    # 计算列数：如果有 b/B/i/I 修饰符行，列数 = 后一半；否则全部
+    # 简单启发式：如果说明符数量能被二整除且前半有 b/B/i/I 修饰符，则取后半
+    if len(all_specs) % 2 == 0:
+        half = len(all_specs) // 2
+        first_half = all_specs[:half]
+        second_half = all_specs[half:]
+        has_modifiers = any('B' in s or 'b' in s or 'I' in s or 'i' in s for s in first_half)
+        has_align = any(s.startswith(('l', 'r', 'c', 'n', 'a', 's', '^')) for s in second_half)
+        if has_modifiers and has_align:
+            col_specs = second_half
+        else:
+            col_specs = all_specs
+    else:
+        col_specs = all_specs
     # 计算实际列数（排除纯修饰符列如 |, ||, _, =）
     alignments: List[str] = []
     for cs in col_specs:
