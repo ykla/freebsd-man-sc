@@ -1233,38 +1233,607 @@ def linkify_xref(line: str, current_section: int, xref: CrossRefDB) -> str:
 
 
 # ============================================================
+# .TH 格式转换（man 格式，非 mdoc）
+# ============================================================
+
+def is_th_format(text: str) -> bool:
+    """检测文件是否为 .TH 格式（man 格式，非 mdoc）。
+
+    mdoc 文件首行非注释行以 .Dt 或 .Dd 开头；
+    .TH 文件首行非注释行以 .TH 开头。
+    """
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith('.\\"') or s.startswith("'\\\""):
+            continue
+        if s.startswith('.TH'):
+            return True
+        if s.startswith('.Dt') or s.startswith('.Dd'):
+            return False
+        # 其他行：可能是 .TH 格式的其他宏
+        if s.startswith('.'):
+            return True  # 默认视为 .TH 格式
+        return False
+    return False
+
+
+def parse_th_line(line: str) -> Tuple[str, int, str]:
+    """解析 .TH 行，返回 (title, section, date)。
+
+    格式：.TH title section date source manual
+    带引号：.TH "CLANG" "1" "2023-05-24" "16" "Clang"
+    """
+    # 去除 .TH 前缀
+    rest = line[3:].strip()
+    # 分割带引号的 token
+    parts: List[str] = []
+    i = 0
+    n = len(rest)
+    while i < n:
+        # 跳过空格
+        while i < n and rest[i] in ' \t':
+            i += 1
+        if i >= n:
+            break
+        if rest[i] == '"':
+            # 引号字符串
+            j = i + 1
+            while j < n and rest[j] != '"':
+                j += 1
+            parts.append(rest[i + 1:j])
+            i = j + 1
+        else:
+            # 非引号 token
+            j = i
+            while j < n and rest[j] not in ' \t':
+                j += 1
+            parts.append(rest[i:j])
+            i = j
+    title = parts[0] if parts else ""
+    section = 0
+    if len(parts) >= 2:
+        m = re.match(r'(\d+)', parts[1])
+        if m:
+            section = int(m.group(1))
+    date = parts[2] if len(parts) >= 3 else ""
+    return title, section, date
+
+
+def th_clean_escapes(text: str) -> str:
+    """清理 .TH 格式的转义字符。"""
+    # \- → -
+    text = text.replace(r'\-', '-')
+    # \\ → \
+    text = text.replace(r'\\', '\\')
+    # \0 → 空格（非断行空格）
+    text = text.replace(r'\0', ' ')
+    # \& → 空字符串（零宽占位符）
+    text = text.replace(r'\&', '')
+    # \(aq → '
+    text = text.replace(r'\(aq', "'")
+    # \(lq → "（左引号）
+    text = text.replace(r'\(lq', '"')
+    # \(rq → "（右引号）
+    text = text.replace(r'\(rq', '"')
+    # \(em → —（破折号）
+    text = text.replace(r'\(em', '—')
+    # \(en → –（短破折号）
+    text = text.replace(r'\(en', '–')
+    # \*(Aq → '
+    text = text.replace(r'\*(Aq', "'")
+    # \m[blue] \m[] — 颜色标记（跳过）
+    text = re.sub(r'\\m\[[^\]]*\]', '', text)
+    # \s-2 \s+2 — 字号（跳过）
+    text = re.sub(r'\\s[+-]?\d+', '', text)
+    # \u \d — 上标/下标（跳过）
+    text = text.replace(r'\u', '').replace(r'\d', '')
+    # \[charNN] — Unicode 字符引用（跳过）
+    text = re.sub(r'\\\[[^\]]*\]', '', text)
+    return text
+
+
+def th_process_font_markup(text: str) -> str:
+    """处理 .TH 格式的内联字体标记 \\fB \\fI \\fR \\fP。
+
+    \\fB...\\fP → **...**
+    \\fI...\\fP → *...*
+    \\fR \\fP → 关闭当前标记
+    """
+    # \fB → 开启加粗
+    # \fI → 开启斜体
+    # \fR → 关闭标记
+    # \fP → 关闭标记（返回上一字体）
+    result: List[str] = []
+    font_stack: List[str] = []  # 'B' or 'I'
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == '\\' and i + 1 < n and text[i + 1] == 'f':
+            if i + 2 < n:
+                font = text[i + 2]
+                if font == 'B':
+                    font_stack.append('B')
+                    result.append('**')
+                    i += 3
+                    continue
+                elif font == 'I':
+                    font_stack.append('I')
+                    result.append('*')
+                    i += 3
+                    continue
+                elif font in ('R', 'P'):
+                    if font_stack:
+                        f = font_stack.pop()
+                        result.append('**' if f == 'B' else '*')
+                    i += 3
+                    continue
+        result.append(text[i])
+        i += 1
+    # 关闭未闭合的标记
+    while font_stack:
+        f = font_stack.pop()
+        result.append('**' if f == 'B' else '*')
+    return ''.join(result)
+
+
+def th_split_macro_args(line: str) -> Tuple[str, List[str]]:
+    """分割 .TH 宏行为 (宏名, [参数])。
+
+    如 .BR \-F <number> → ('BR', ['-F', '<number>'])
+    如 .B ipf → ('B', ['ipf'])
+    """
+    # 去除前导 .
+    rest = line[1:] if line.startswith('.') else line
+    parts: List[str] = []
+    i = 0
+    n = len(rest)
+    while i < n:
+        while i < n and rest[i] in ' \t':
+            i += 1
+        if i >= n:
+            break
+        # 引号字符串
+        if rest[i] == '"':
+            j = i + 1
+            while j < n and rest[j] != '"':
+                j += 1
+            parts.append(rest[i + 1:j])
+            i = j + 1
+        else:
+            j = i
+            while j < n and rest[j] not in ' \t':
+                j += 1
+            parts.append(rest[i:j])
+            i = j
+    if not parts:
+        return '', []
+    return parts[0], parts[1:]
+
+
+def th_format_alternating(macro: str, args: List[str]) -> str:
+    """处理交替字体宏 .BR .BI .IR .RB .RI .IB 等。
+
+    .BR a b c → **a** b **c**（B/R 交替）
+    .BI a b → **a** *b*
+    .IR a b → *a* b
+    """
+    if not macro or len(macro) < 2:
+        return ' '.join(args)
+    fonts = list(macro[1:])  # 如 'BR' → ['B', 'R']
+    result: List[str] = []
+    for idx, arg in enumerate(args):
+        font = fonts[idx % len(fonts)]
+        cleaned = th_clean_escapes(arg)
+        if font == 'B':
+            result.append(f'**{cleaned}**')
+        elif font == 'I':
+            result.append(f'*{cleaned}*')
+        else:  # R
+            result.append(cleaned)
+    return ''.join(result)
+
+
+# .TH 章节标题英文→中文映射（与 mdoc 相同）
+TH_SECTION_MAP = {
+    'NAME': '名称',
+    'SYNOPSIS': '概要',
+    'DESCRIPTION': '描述',
+    'OPTIONS': '选项',
+    'EXIT STATUS': '退出状态',
+    'EXAMPLES': '实例',
+    'SEE ALSO': '参见',
+    'STANDARDS': '标准',
+    'HISTORY': '历史',
+    'AUTHORS': '作者',
+    'BUGS': '缺陷',
+    'CAVEATS': '注意事项',
+    'DIAGNOSTICS': '诊断',
+    'ERRORS': '错误',
+    'ENVIRONMENT': '环境变量',
+    'FILES': '文件',
+    'LEGAL': '法律条款',
+    'WARNING': '警告',
+    'COMPILATION': '编译',
+    'OVERVIEW': '概述',
+    'LIBRARY': '库',
+    'NOTES': '注意',
+    'RETURN VALUE': '返回值',
+    'COPYRIGHT': '版权',
+}
+
+
+def convert_th_to_markdown(text: str, display_name: str, section: int,
+                           xref: CrossRefDB) -> str:
+    """将 .TH 格式 man 页面转换为 markdown。
+
+    处理 .TH .SH .SS .B .I .BR .BI .IR .TP .PP .nf .fi 等宏，
+    以及 \\fB \\fI \\fR \\fP 内联字体标记。
+    """
+    lines = text.splitlines()
+    out: List[str] = []
+    out.append(f"# {display_name.lower()}({section})")
+    out.append("")
+
+    # 解析 .TH 行获取日期
+    date = ""
+    in_code_block = False  # .nf/.fi 代码块
+    in_synopsis = False    # SYNOPSIS 章节
+    synopsis_lines: List[str] = []
+    skipping_macro_def = False  # .de/.de1 宏定义块
+
+    # .TP 标签处理
+    pending_tp = False  # 下一行是 .TP 的标签
+
+    # 当前章节
+    current_section = ""
+
+    for line in lines:
+        # 跳过注释行
+        if line.startswith('.\\"') or line.startswith("'\\\"") or line.startswith("'\""):
+            continue
+
+        # 宏定义块跳过
+        if re.match(r'^\.de1?\s', line):
+            skipping_macro_def = True
+            continue
+        if skipping_macro_def:
+            if line.strip() == '..':
+                skipping_macro_def = False
+            continue
+
+        stripped = line.strip()
+
+        # 空行
+        if not stripped:
+            if in_code_block:
+                out.append("")
+            elif in_synopsis:
+                pass  # synopsis 内空行忽略
+            else:
+                out.append("")
+            continue
+
+        # .TH 行
+        if stripped.startswith('.TH'):
+            _, _, date = parse_th_line(stripped)
+            continue
+
+        # 跳过的 roff 控制宏
+        if re.match(r'^\.(nr|ds|ie|el|nh|ad|ft|in|ti|ta|ll|po|pl|ne|hy|IX|rs|re)\b', stripped) or \
+           re.match(r'^\.(nr|ds|ie|el|nh|ad|ft|in|ti|ta|ll|po|pl|ne|hy|IX|rs|re)$', stripped):
+            continue
+        if stripped == '.DT':
+            continue
+        if stripped.startswith('.INDENT') or stripped.startswith('.UNINDENT'):
+            continue
+        if stripped == '.sp' or stripped == '.sp 1':
+            if not in_code_block and not in_synopsis:
+                out.append("")
+            continue
+
+        # .nf — 开始代码块
+        if stripped == '.nf' or stripped.startswith('.nf '):
+            if in_synopsis:
+                pass  # synopsis 内不嵌套代码块
+            else:
+                in_code_block = True
+                out.append("```sh")
+            continue
+
+        # .fi — 结束代码块
+        if stripped == '.fi' or stripped.startswith('.fi '):
+            if in_code_block:
+                out.append("```")
+                out.append("")
+                in_code_block = False
+            continue
+
+        # 代码块内：直接输出（清理转义）
+        if in_code_block:
+            content = th_clean_escapes(line)
+            out.append(content)
+            continue
+
+        # .PP / .LP — 段落分隔
+        if stripped in ('.PP', '.LP', '.P', '.PP ') or stripped.startswith('.PP '):
+            if in_synopsis:
+                pass
+            else:
+                out.append("")
+            continue
+
+        # .br — 行分隔
+        if stripped == '.br':
+            if not in_synopsis:
+                out.append("")
+            continue
+
+        # .RS / .RE — 缩进（跳过，输出空行分隔）
+        if stripped.startswith('.RS') or stripped.startswith('.RE'):
+            if not in_synopsis:
+                out.append("")
+            continue
+
+        # .SH — 章节标题
+        if stripped.startswith('.SH'):
+            # 提取章节名
+            sec_name = stripped[3:].strip()
+            # 去除引号
+            sec_name = sec_name.strip('"').strip("'")
+            # 去除多余空格
+            sec_name = re.sub(r'\s+', ' ', sec_name)
+            current_section = sec_name.upper()
+
+            # SYNOPSIS 章节特殊处理
+            if current_section == 'SYNOPSIS':
+                in_synopsis = True
+                synopsis_lines = []
+                out.append("## SYNOPSIS")
+                out.append("")
+                continue
+
+            in_synopsis = False  # 退出 SYNOPSIS
+
+            # 翻译章节标题
+            cn_name = TH_SECTION_MAP.get(current_section, sec_name)
+            out.append(f"## {cn_name}")
+            out.append("")
+            continue
+
+        # .SS — 子章节标题
+        if stripped.startswith('.SS'):
+            sub_name = stripped[3:].strip().strip('"').strip("'")
+            sub_name = re.sub(r'\s+', ' ', sub_name)
+            in_synopsis = False  # 退出 SYNOPSIS
+            out.append(f"### {sub_name}")
+            out.append("")
+            continue
+
+        # .TP — 标签段落（下一行是标签）
+        if stripped == '.TP' or stripped.startswith('.TP '):
+            pending_tp = True
+            if in_synopsis:
+                in_synopsis = False  # SYNOPSIS 内遇到 .TP 表示结束
+                # 输出收集的 synopsis
+                syn_out = _th_format_synopsis(synopsis_lines, display_name, section, xref)
+                out.extend(syn_out)
+                synopsis_lines = []
+            continue
+
+        # .IP — 缩进段落
+        if stripped.startswith('.IP'):
+            # .IP 类似 .TP，但标签在同行的参数中
+            _, args = th_split_macro_args(stripped)
+            if args:
+                tag = th_clean_escapes(args[0])
+                tag = th_process_font_markup(tag)
+                out.append(f"- {tag}")
+            continue
+
+        # SYNOPSIS 章节：收集所有行
+        if in_synopsis:
+            synopsis_lines.append(line)
+            continue
+
+        # .B / .I / .BR / .BI / .IR 等 — 字体宏
+        m = re.match(r'^\.(B|I|BR|BI|IR|RB|RI|IB|SB|SM)\b\s*(.*)$', stripped)
+        if m:
+            macro = m.group(1)
+            rest = m.group(2)
+            # 分割参数
+            if macro in ('B', 'I', 'SB', 'SM'):
+                # .B text → **text** 或 *text*
+                content = th_clean_escapes(rest)
+                content = th_process_font_markup(content)
+                if macro in ('B', 'SB'):
+                    formatted = f'**{content}**' if not content.startswith('**') else content
+                else:  # I, SM
+                    formatted = f'*{content}*' if not content.startswith('*') else content
+            else:
+                # .BR .BI .IR .RB .RI .IB — 交替字体
+                _, args = th_split_macro_args(stripped)
+                if args:
+                    formatted = th_format_alternating(macro, args)
+                else:
+                    formatted = ''
+            if pending_tp:
+                # 这是 .TP 后的标签行
+                out.append(f"- {formatted}")
+                pending_tp = False
+            else:
+                out.append(formatted)
+            continue
+
+        # 普通文本行（含 \fB \fI 等内联标记）
+        content = th_clean_escapes(line)
+        content = th_process_font_markup(content)
+
+        if pending_tp:
+            # 这是 .TP 后的标签行（普通文本）
+            out.append(f"- {content}")
+            pending_tp = False
+        else:
+            # 交叉引用链接化
+            content = linkify_xref(content, section, xref)
+            # 如果前一行是 "- tag"（列表项），当前行是描述，合并
+            if out and out[-1].startswith('- '):
+                out[-1] = out[-1] + ' ' + content
+            else:
+                out.append(content)
+
+    # 处理 SYNOPSIS 章节末尾
+    if in_synopsis and synopsis_lines:
+        syn_out = _th_format_synopsis(synopsis_lines, display_name, section, xref)
+        out.extend(syn_out)
+
+    result = '\n'.join(out)
+    # 清理多余空行
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    # 清理 ** ** 之间的空连接
+    result = re.sub(r'\*\*\s+\*\*', '', result)
+    # 清理 * * 之间的空连接
+    result = re.sub(r'\*\s+\*', '', result)
+    return result.strip() + '\n'
+
+
+def _th_format_synopsis(lines: List[str], display_name: str, section: int,
+                        xref: CrossRefDB) -> List[str]:
+    """格式化 .TH 格式的 SYNOPSIS 章节。
+
+    .B cmd
+    [
+    .B \-options
+    ] [
+    .B \-l
+    <block|pass|nomatch>
+    ]
+
+    合并为单行反引号包裹的命令行。
+    """
+    parts: List[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # 处理宏行
+        m = re.match(r'^\.(B|I|BR|BI|IR|RB|RI|IB|SB|SM)\b\s*(.*)$', stripped)
+        if m:
+            macro = m.group(1)
+            rest = m.group(2)
+            if macro in ('B', 'SB'):
+                content = th_clean_escapes(rest)
+                content = th_process_font_markup(content)
+                # 去除 ** 标记，保留纯文本
+                content = re.sub(r'\*\*([^*]+)\*\*', r'\1', content)
+                content = re.sub(r'\*([^*]+)\*', r'\1', content)
+                parts.append(content)
+            elif macro in ('I', 'SM'):
+                content = th_clean_escapes(rest)
+                content = th_process_font_markup(content)
+                content = re.sub(r'\*\*([^*]+)\*\*', r'\1', content)
+                content = re.sub(r'\*([^*]+)\*', r'\1', content)
+                parts.append(content)
+            else:
+                _, args = th_split_macro_args(stripped)
+                if args:
+                    formatted = th_format_alternating(macro, args)
+                    # 去除标记
+                    formatted = re.sub(r'\*\*([^*]+)\*\*', r'\1', formatted)
+                    formatted = re.sub(r'\*([^*]+)\*', r'\1', formatted)
+                    parts.append(formatted)
+            continue
+        # 跳过的宏
+        if stripped.startswith('.nf') or stripped.startswith('.fi'):
+            continue
+        if stripped.startswith('.PP') or stripped == '.br' or stripped == '.sp':
+            continue
+        # 普通文本行
+        content = th_clean_escapes(stripped)
+        content = th_process_font_markup(content)
+        # 去除标记
+        content = re.sub(r'\*\*([^*]+)\*\*', r'\1', content)
+        content = re.sub(r'\*([^*]+)\*', r'\1', content)
+        if content:
+            parts.append(content)
+
+    # 合并所有部分为单行
+    merged = ' '.join(parts)
+    # 压缩多空格
+    merged = re.sub(r'\s+', ' ', merged).strip()
+    # 修复 [ -opt ] → [-opt]
+    merged = re.sub(r'\[\s+', '[', merged)
+    merged = re.sub(r'\s+\]', ']', merged)
+    # 修复 < file > → <file>
+    merged = re.sub(r'<\s+', '<', merged)
+    merged = re.sub(r'\s+>', '>', merged)
+
+    out: List[str] = []
+    if merged:
+        out.append(f'`{merged}`')
+        out.append('')
+    return out
+
+
+# ============================================================
 # 转换：单文件
 # ============================================================
 
 def convert_one(src_path: Path, out_dir: Path, xref: CrossRefDB,
                 alias_name: Optional[str] = None) -> Tuple[Path, str, int, str]:
-    """转换单个 mdoc 文件为 markdown。
+    """转换单个 man 页面为 markdown（自动检测 mdoc/.TH 格式）。
     alias_name: 若为别名，用此名作为标题与输出文件名。
     返回 (输出路径, 显示名, 章节, 日期)。
     """
     text = src_path.read_text(encoding="utf-8", errors="replace")
-    name, section, date = parse_header(text)
-    if not name:
-        name = src_path.name.split(".")[0]
-    if not section:
-        section = section_from_suffix(src_path.name) or 1
+    is_th = is_th_format(text)
+
+    if is_th:
+        # .TH 格式：用 Python 转换器
+        _, sec_from_th, date = _th_parse_header(text)
+        name, section, _ = parse_header(text)  # mdoc 解析器对 .TH 返回空
+        if not name:
+            # 从 .TH 行解析
+            th_name = _th_parse_header(text)[0]
+            name = th_name or src_path.name.split(".")[0]
+        if not section:
+            section = sec_from_th or section_from_suffix(src_path.name) or 1
+        if not date:
+            date = _th_parse_header(text)[2]
+    else:
+        # mdoc 格式
+        name, section, date = parse_header(text)
+        if not name:
+            name = src_path.name.split(".")[0]
+        if not section:
+            section = section_from_suffix(src_path.name) or 1
 
     display_name = alias_name or name
     out_name = f"{safe_filename(display_name)}.{section}.md"
     out_path = out_dir / out_name
-    tmp_path = out_dir / f".{out_name}.tmp"
 
-    # 调用 mandoc 转换
-    run_mandoc(src_path, tmp_path)
-    md = tmp_path.read_text(encoding="utf-8", errors="replace")
+    if is_th:
+        # .TH 格式转换
+        processed = convert_th_to_markdown(text, display_name, section, xref)
+        out_path.write_text(processed, encoding="utf-8")
+    else:
+        # mdoc 格式：mandoc + 后处理
+        tmp_path = out_dir / f".{out_name}.tmp"
+        run_mandoc(src_path, tmp_path)
+        md = tmp_path.read_text(encoding="utf-8", errors="replace")
+        processed = post_process(md, display_name, section, xref)
+        out_path.write_text(processed, encoding="utf-8")
+        tmp_path.unlink(missing_ok=True)
 
-    # 后处理
-    processed = post_process(md, display_name, section, xref)
-    out_path.write_text(processed, encoding="utf-8")
-
-    # 清理临时文件
-    tmp_path.unlink(missing_ok=True)
     return out_path, display_name, section, date
+
+
+def _th_parse_header(text: str) -> Tuple[str, int, str]:
+    """从 .TH 格式文本解析标题、章节、日期。"""
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith('.TH'):
+            return parse_th_line(s)
+    return "", 0, ""
 
 
 # ============================================================
