@@ -799,6 +799,11 @@ def post_process(md: str, display_name: str, section: int,
 
         # 非代码块内：清理转义和格式
         if not in_code_block:
+            # tab/8空格缩进行将转为代码块，跳过内联格式处理（避免损坏 C 代码指针/注释）
+            if line.startswith('\t') or re.match(r'^ {8,}', line):
+                out.append(line)
+                i += 1
+                continue
             # 清理转义字符
             line = clean_mandoc_escapes(line)
             # 去除 > 引用块前缀（mandoc 用 > 包裹 .It 列表项内容）
@@ -851,6 +856,8 @@ def convert_literal_blocks(text: str) -> str:
                 ln = lines[i]
                 if ln.startswith('\t') or re.match(r'^ {8,}', ln):
                     content = ln.lstrip(' \t')
+                    # 清理 HTML 实体和转义字符（代码块内的 C 代码注释等）
+                    content = clean_mandoc_escapes(content)
                     block.append(content)
                     i += 1
                 elif ln.strip() == '':
