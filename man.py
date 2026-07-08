@@ -1380,8 +1380,12 @@ def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) ->
                 new_font = font
                 if font == 'P':
                     new_font = prev_font
-                # 只在字体真正改变时更新 prev_font
-                if font != 'P' and new_font != current_font:
+                # 无操作：新字体与当前字体相同（如 \fB 后紧跟 \fB）
+                if new_font == current_font:
+                    i += 3
+                    continue
+                # 字体真正改变时更新 prev_font
+                if font != 'P':
                     prev_font = current_font
                 # 关闭当前字体标记
                 if current_font == 'B':
