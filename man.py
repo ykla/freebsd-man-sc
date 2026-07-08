@@ -2305,6 +2305,11 @@ def _tbl_to_markdown(tbl_lines: List[str]) -> str:
 
         # 分割单元格
         cells = line.split(tab_sep)
+        # 去除首尾空单元格（tbl 数据行可能以 tab 开头/结尾）
+        while cells and cells[0] == '':
+            cells.pop(0)
+        while cells and cells[-1] == '':
+            cells.pop()
         rows.append(cells)
 
     if not rows:
