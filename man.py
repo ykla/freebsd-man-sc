@@ -1949,8 +1949,25 @@ def _th_format_synopsis(lines: List[str], display_name: str, section: int,
         return out
 
     # 复杂 SYNOPSIS：逐行处理，保留结构
+    # 收集函数签名到代码块，按 .SS 子章节分组
     in_nf = False
     nf_lines: List[str] = []
+    sig_lines: List[str] = []  # 当前子章节的函数签名
+    in_sig_block = False  # 是否正在收集函数签名
+
+    def _flush_sig_block():
+        """输出当前收集的函数签名代码块。"""
+        nonlocal sig_lines, in_sig_block
+        if not sig_lines:
+            return
+        out.append('```c')
+        for sl in sig_lines:
+            out.append(sl)
+        out.append('```')
+        out.append('')
+        sig_lines.clear()
+        in_sig_block = False
+
     for line in lines:
         stripped = line.strip()
         if not stripped:
@@ -1958,6 +1975,7 @@ def _th_format_synopsis(lines: List[str], display_name: str, section: int,
 
         # .nf — 开始代码块
         if stripped == '.nf' or stripped.startswith('.nf '):
+            _flush_sig_block()
             in_nf = True
             continue
         # .fi — 结束代码块
@@ -1979,8 +1997,9 @@ def _th_format_synopsis(lines: List[str], display_name: str, section: int,
                 nf_lines.append(content)
             continue
 
-        # .SS — 子章节
+        # .SS — 子章节（先输出前面的代码块，再输出标题）
         if stripped.startswith('.SS'):
+            _flush_sig_block()
             sub_name = stripped[3:].strip().strip('"').strip("'")
             sub_name = th_clean_escapes(sub_name)
             sub_name = re.sub(r'\s+', ' ', sub_name).strip()
@@ -1996,8 +2015,9 @@ def _th_format_synopsis(lines: List[str], display_name: str, section: int,
         if stripped.startswith('.ft'):
             continue
 
-        # .sp / .PP — 段落分隔，跳过
+        # .sp / .PP — 段落分隔，先输出代码块
         if stripped.startswith('.sp') or stripped.startswith('.PP'):
+            _flush_sig_block()
             continue
 
         # .B / .I / .BR / .BI 等 — 字体宏（函数签名）
@@ -2005,34 +2025,32 @@ def _th_format_synopsis(lines: List[str], display_name: str, section: int,
         if m:
             macro = m.group(1)
             rest = m.group(2)
+            in_sig_block = True
             if macro in ('B', 'SB', 'I', 'SM'):
                 content = th_clean_escapes(rest)
                 content = th_process_font_markup(content)
-                content = re.sub(r'\*\*([^*]+)\*\*', r'\1', content)
-                content = re.sub(r'\*([^*]+)\*', r'\1', content)
+                content = _strip_markers(content)
             else:
                 _, args = th_split_macro_args(stripped)
                 if args:
                     formatted = th_format_alternating(macro, args)
-                    formatted = re.sub(r'\*\*([^*]+)\*\*', r'\1', formatted)
-                    formatted = re.sub(r'\*([^*]+)\*', r'\1', formatted)
+                    formatted = _strip_markers(formatted)
                     content = formatted
                 else:
                     content = ''
             if content:
-                out.append(f'`{content}`')
-                out.append('')
+                sig_lines.append(content)
             continue
 
         # 普通文本行（如 const char *malloc_conf;）
         content = th_clean_escapes(stripped)
         content = th_process_font_markup(content)
-        content = re.sub(r'\*\*([^*]+)\*\*', r'\1', content)
-        content = re.sub(r'\*([^*]+)\*', r'\1', content)
+        content = _strip_markers(content)
         if content:
-            out.append(f'`{content}`')
-            out.append('')
+            in_sig_block = True
+            sig_lines.append(content)
 
+    _flush_sig_block()
     return out
 
 
