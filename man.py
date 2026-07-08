@@ -1,44 +1,46 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-man.py — FreeBSD man 手册英文 GitBook 项目生成器（单体脚本）
+man.py — FreeBSD man 手册英文 GitBook 项目生成器（单体脚本，调用 mandoc）
 
 功能：
-  1. 从 en/freebsd-src-main.zip 提取并转换所有实际安装的 man 页面（man1-man9）
-     为 Markdown（GitBook 格式），输出到 en/manN/ 下。
-  2. 精准识别 MLINKS 别名（如 vi/edit），别名独立生成文件（重复内容，标题用别名），
-     别名清单写入 .github/aliases.txt。
-  3. 每个页面的 .Dd（日期）与 .Dt（标题+章节）单独写入 .github/dates/，方便比较更新。
-  4. 精准识别交叉引用 .Xr，生成 markdown 链接，目标不存在时降级为纯文本。
-  5. 生成 SUMMARY.md（根目录），man2/man3 按子目录二级标题分组，
-     man2/man3 建空 README.md。
-  6. 所有 md 文件名小写、Windows 兼容。
-  7. 集成 AutoCorrect、md-padding 清理（仅生成差异报告，人工逐条复核）。
-
-设计：
-  - 纯 Python 标准库实现，无第三方依赖（mandoc 在 Windows 无预编译版本，
-    且 mandoc 不直接输出 markdown；本脚本内置 mdoc→markdown 解析器）。
-  - 幂等：重复运行覆盖已有文件。
-  - 流程主体发生在 en/ 文件夹；SUMMARY.md、.github/ 为特别指定输出。
+  1. 确保 mandoc_convert.exe 已编译（调用 script/build_mandoc.py）
+  2. 从 en/freebsd-src-main.zip 提取源码树（或按需提取单文件预览）
+  3. 扫描所有实际安装的 man 页面（man1-man9，含分散在 bin/sbin/usr.bin/lib/sys 等）
+  4. 精准解析 MLINKS 别名（如 vi/edit），别名独立生成文件（重复内容，标题用别名）
+  5. 调用 mandoc_convert.exe 将 mdoc→markdown，后处理：
+     - H1 标题改为 `命令名(N)` 小写格式
+     - 降级标题层级（mandoc 的 # → ##，## → ###），使页面 H1 为标题
+     - 交叉引用 name(N) 链接化（同章节相对链接，跨章节 ../manN/）
+     - 去除 mandoc 页脚行
+  6. 生成 SUMMARY.md（根目录），man2/man3 按源码子目录二级标题分组
+  7. 生成 .github/aliases.txt（别名清单）、.github/dates/（每页 .Dd 日期）
+  8. man2/man3 建空 README.md
+  9. 所有 md 文件名小写、Windows 兼容
 
 用法：
   python man.py preview man      # 仅转换 man(1) 预览
   python man.py all              # 转换所有 man 页面
-  python man.py summary          # 仅重新生成 SUMMARY.md
-  python man.py clean            # 运行 AutoCorrect/md-padding 差异报告
+  python man.py summary          # 仅重新生成 SUMMARY.md（基于已有 en/manN/）
   python man.py dates            # 仅重新生成 .github/dates/
   python man.py aliases          # 仅重新生成 .github/aliases.txt
+  python man.py clean            # 运行 AutoCorrect/md-padding 差异报告
 
 依赖：
-  - Python 3.9+（标准库 zipfile/re/os/sys/json/pathlib）
-  - 可选：mandoc（用于 lint 校验，非转换必需）
+  - Python 3.9+（标准库 zipfile/re/subprocess/pathlib）
+  - MinGW gcc（编译 mandoc；script/build_mandoc.py 自动调用）
   - 可选：autocorrect、md-padding（用于最终清理差异报告）
+
+输出位置：
+  - en/manN/命令.N.md    — 英文 markdown 页面
+  - en/SUMMARY.md        — 英文项目 TOC（不覆盖根目录 SUMMARY.md）
+  - SUMMARY.md           — 根目录 GitBook TOC（指向 en/manN/）
+  - .github/aliases.txt  — MLINKS 别名清单
+  - .github/dates/manN.txt — 每页日期
 """
 
 from __future__ import annotations
 
-import io
-import json
 import os
 import re
 import shutil
@@ -46,94 +48,31 @@ import subprocess
 import sys
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 # ============================================================
-# 配置
+# 路径配置
 # ============================================================
 
 ROOT = Path(__file__).resolve().parent
 EN_DIR = ROOT / "en"
 ZIP_PATH = EN_DIR / "freebsd-src-main.zip"
 SRC_DIR = EN_DIR / "freebsd-src-main"  # 解压目录
+BUILD_DIR = EN_DIR / "mandoc-build"
+MANDOC_EXE = BUILD_DIR / "mandoc_convert.exe"
+BUILD_SCRIPT = ROOT / "script" / "build_mandoc.py"
+
 GITHUB_DIR = ROOT / ".github"
 DATES_DIR = GITHUB_DIR / "dates"
 ALIASES_FILE = GITHUB_DIR / "aliases.txt"
 SUMMARY_FILE = ROOT / "SUMMARY.md"
+EN_SUMMARY_FILE = EN_DIR / "SUMMARY.md"
 
-# man 章节中文名（SUMMARY.md 用）
+# man 章节标题（SUMMARY.md 分组用）
 SECTION_TITLES = {
-    1: "man1",
-    2: "man2",
-    3: "man3",
-    4: "man4",
-    5: "man5",
-    6: "man6",
-    7: "man7",
-    8: "man8",
-    9: "man9",
+    1: "man1", 2: "man2", 3: "man3", 4: "man4", 5: "man5",
+    6: "man6", 7: "man7", 8: "man8", 9: "man9",
 }
-
-# mdoc .Sh 章节中文翻译
-SH_TITLES = {
-    "NAME": "名称",
-    "SYNOPSIS": "概要",
-    "DESCRIPTION": "描述",
-    "OPTIONS": "选项",
-    "EXIT STATUS": "退出状态",
-    "EXAMPLES": "实例",
-    "SEE ALSO": "参见",
-    "STANDARDS": "标准",
-    "HISTORY": "历史",
-    "AUTHORS": "作者",
-    "BUGS": "缺陷",
-    "CAVEATS": "注意事项",
-    "DIAGNOSTICS": "诊断",
-    "ERRORS": "错误",
-    "ENVIRONMENT": "环境变量",
-    "FILES": "文件",
-    "LEGAL": "法律条款",
-    "WARNING": "警告",
-    "RETURN VALUES": "返回值",
-    "COMPATIBILITY": "兼容性",
-    "IMPLEMENTATION NOTES": "实现说明",
-    "PROGRAMMING GUIDE": "编程指南",
-    "INTERNALS": "内部实现",
-    "HARDWARE": "硬件",
-    "PROTOCOLS": "协议",
-    "DESCRIPTIONS": "描述",
-    "DEVICE FLAGS": "设备标志",
-    "LOADER TUNABLES": "加载器可调参数",
-    "SYSCTL VARIABLES": "sysctl 变量",
-    "AUTOCONFIGURATION": "自动配置",
-    "DIAGNOSTICS": "诊断",
-    "SYSTEM MANAGER'S MANUAL": "系统管理员手册",
-}
-
-# 实际安装 man 页面的源码树位置（man1-man9）
-# share/man/manN/ 下的直接安装；命令 man 页面分散在 bin/sbin/usr.bin/ 等
-MAN_SOURCE_DIRS = [
-    "share/man/man{N}",       # 系统手册
-    "bin",                    # 基本命令 (cat.1 等)
-    "sbin",                   # 系统命令
-    "usr.bin",                # 用户命令
-    "usr.sbin",               # 系统管理命令
-    "libexec",                # 库可执行文件
-    "stand",                  # 引导加载器
-    "gnu/usr.bin",            # GNU 工具
-    "gnu/usr.sbin",           # GNU 系统工具
-    "cddl/usr.bin",           # CDDL 工具
-    "cddl/usr.sbin",          # CDDL 系统工具
-    "secure/usr.bin",         # 安全工具
-    "secure/usr.sbin",        # 安全系统工具
-    "kerberos5/usr.bin",      # Kerberos
-    "kerberos5/usr.sbin",     # Kerberos 系统
-    "kerberos5/lib",          # Kerberos 库
-    "crypto/openssh",         # OpenSSH
-    "lib",                    # 库（man2/man3 分散在 lib/libc/ 等）
-    "libexec/rtld-elf",       # 运行时链接器
-    "sys",                    # 内核（部分 man4/man9）
-]
 
 
 # ============================================================
@@ -160,8 +99,28 @@ def section_from_suffix(filename: str) -> Optional[int]:
     return None
 
 
-def read_zip_text(zf: zipfile.ZipFile, name: str) -> str:
-    return zf.read(name).decode("utf-8", "replace")
+# ============================================================
+# mandoc 编译保障
+# ============================================================
+
+def ensure_mandoc() -> None:
+    """确保 mandoc_convert.exe 已编译，否则调用 build_mandoc.py。"""
+    if MANDOC_EXE.exists():
+        return
+    log(f"mandoc_convert.exe 不存在，开始编译...")
+    if not BUILD_SCRIPT.exists():
+        raise FileNotFoundError(f"未找到构建脚本：{BUILD_SCRIPT}")
+    r = subprocess.run(
+        [sys.executable, str(BUILD_SCRIPT)],
+        cwd=ROOT, capture_output=True, text=True
+    )
+    if r.returncode != 0:
+        log(r.stdout[-2000:])
+        log(r.stderr[-2000:])
+        raise RuntimeError("mandoc 编译失败，详见上方输出")
+    if not MANDOC_EXE.exists():
+        raise RuntimeError(f"编译完成但 {MANDOC_EXE} 仍不存在")
+    log("mandoc_convert.exe 编译完成")
 
 
 # ============================================================
@@ -171,17 +130,37 @@ def read_zip_text(zf: zipfile.ZipFile, name: str) -> str:
 def extract_zip(force: bool = False) -> None:
     """解压 freebsd-src-main.zip 到 en/freebsd-src-main/。"""
     if SRC_DIR.exists() and not force:
-        # 检查是否已解压完整（通过标志文件）
-        if (SRC_DIR / "README.md").exists() or (SRC_DIR / "share").exists():
-            log(f"已解压到 {SRC_DIR}，跳过（使用 force=True 强制重解压）")
+        if (SRC_DIR / "share").exists() or (SRC_DIR / "README.md").exists():
+            log(f"已解压到 {SRC_DIR}，跳过（force=True 强制重解压）")
             return
     if not ZIP_PATH.exists():
         raise FileNotFoundError(f"未找到 {ZIP_PATH}")
-    log(f"解压 {ZIP_PATH.name} 到 {SRC_DIR}...")
-    SRC_DIR.mkdir(parents=True, exist_ok=True)
+    log(f"解压 {ZIP_PATH.name} 到 {SRC_DIR}（可能需要数分钟）...")
     with zipfile.ZipFile(ZIP_PATH) as zf:
         zf.extractall(EN_DIR)
     log("解压完成")
+
+
+def find_man_in_zip(name: str, section: int) -> Optional[str]:
+    """在 zip 中查找指定 name.N 的源文件路径，返回 zip 内路径。"""
+    if not ZIP_PATH.exists():
+        return None
+    target_suffix = f"/{name}.{section}"
+    with zipfile.ZipFile(ZIP_PATH) as zf:
+        candidates = []
+        for n in zf.namelist():
+            if n.endswith(target_suffix):
+                candidates.append(n)
+        if len(candidates) == 1:
+            return candidates[0]
+        if candidates:
+            # 优先选 share/man/manN/ 下的
+            for c in candidates:
+                if f"share/man/man{section}/" in c:
+                    return c
+            # 否则选最短路径（通常是最直接的）
+            return sorted(candidates, key=len)[0]
+    return None
 
 
 def scan_man_files() -> List[Path]:
@@ -190,42 +169,47 @@ def scan_man_files() -> List[Path]:
         raise FileNotFoundError(f"源码树不存在：{SRC_DIR}，请先解压")
     results: List[Path] = []
     seen: Set[Path] = set()
+
+    def matches_man(name: str, n: int) -> bool:
+        return bool(re.match(rf'^[^/]+\.{n}(\.[a-z0-9]+)?$', name))
+
     # 1. share/man/manN/ 下所有文件
     for n in range(1, 10):
         d = SRC_DIR / "share" / "man" / f"man{n}"
         if d.exists():
             for p in d.iterdir():
-                if p.is_file() and re.match(rf'^[^.]+\.{n}(\.[a-z0-9]+)?$', p.name):
+                if p.is_file() and matches_man(p.name, n):
                     if p not in seen:
                         seen.add(p)
                         results.append(p)
+
     # 2. 分散在 bin/sbin/usr.bin/ 等的命令 man 页面
     skip_dirs = {"contrib", "tests", "tools", "release", "packages"}
-    for top in ["bin", "sbin", "usr.bin", "usr.sbin", "libexec", "stand",
+    top_dirs = ["bin", "sbin", "usr.bin", "usr.sbin", "libexec", "stand",
                 "gnu/usr.bin", "gnu/usr.sbin", "cddl/usr.bin", "cddl/usr.sbin",
                 "secure/usr.bin", "secure/usr.sbin", "kerberos5/usr.bin",
                 "kerberos5/usr.sbin", "kerberos5/lib", "crypto/openssh",
-                "libexec/rtld-elf"]:
+                "libexec/rtld-elf"]
+    for top in top_dirs:
         d = SRC_DIR / top
         if not d.exists():
             continue
         for p in d.rglob("*"):
             if not p.is_file():
                 continue
-            # 跳过 contrib/tests/tools 等
             rel = p.relative_to(SRC_DIR).as_posix()
             if any(rel.startswith(s + "/") for s in skip_dirs):
                 continue
             n = section_from_suffix(p.name)
             if n is None or n < 1 or n > 9:
                 continue
-            # 文件名应为 命令.N 格式
-            if not re.match(rf'^[^/]+\.{n}(\.[a-z0-9]+)?$', p.name):
+            if not matches_man(p.name, n):
                 continue
             if p not in seen:
                 seen.add(p)
                 results.append(p)
-    # 3. lib/ 下的库函数 man2/man3（如 lib/libc/string/strcpy.3）
+
+    # 3. lib/ 下的库函数 man2/man3/man9
     lib_dir = SRC_DIR / "lib"
     if lib_dir.exists():
         for p in lib_dir.rglob("*"):
@@ -237,11 +221,12 @@ def scan_man_files() -> List[Path]:
             n = section_from_suffix(p.name)
             if n is None or n not in (2, 3, 9):
                 continue
-            if not re.match(rf'^[^/]+\.{n}(\.[a-z0-9]+)?$', p.name):
+            if not matches_man(p.name, n):
                 continue
             if p not in seen:
                 seen.add(p)
                 results.append(p)
+
     # 4. sys/ 下的内核 man4/man9
     sys_dir = SRC_DIR / "sys"
     if sys_dir.exists():
@@ -254,11 +239,12 @@ def scan_man_files() -> List[Path]:
             n = section_from_suffix(p.name)
             if n is None or n not in (4, 9):
                 continue
-            if not re.match(rf'^[^/]+\.{n}(\.[a-z0-9]+)?$', p.name):
+            if not matches_man(p.name, n):
                 continue
             if p not in seen:
                 seen.add(p)
                 results.append(p)
+
     return sorted(results)
 
 
@@ -267,13 +253,12 @@ def scan_man_files() -> List[Path]:
 # ============================================================
 
 def parse_mlinks() -> Dict[str, str]:
-    """从所有 Makefile 解析 MLINKS，返回 {别名目标文件相对路径: 主文件相对路径}。
+    """从所有 Makefile 解析 MLINKS，返回 {别名文件名: 主文件名}。
 
     MLINKS 格式：
       MLINKS = cat.1 catcat.1 \\
                dog.1 dogdog.1
-    每对 (主, 别名)，别名文件链接到主文件。
-    返回的 key 为别名（如 catcat.1），value 为主文件（如 cat.1）。
+    每对 (主, 别名)。
     """
     aliases: Dict[str, str] = {}
     pattern = re.compile(r'^MLINKS\s*[+:]?=\s*(.*)$', re.MULTILINE)
@@ -284,634 +269,27 @@ def parse_mlinks() -> Dict[str, str]:
             text = mk.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
-        # 合并续行
-        text = re.sub(r'\\\s*\n\s*', ' ', text)
+        text = re.sub(r'\\\s*\n\s*', ' ', text)  # 合并续行
         for m in pattern.finditer(text):
             chunk = m.group(1)
-            # 截取到下一个变量赋值或行尾
             chunk = re.split(r'\s+\w+\s*[+:]?=', chunk)[0]
             tokens = chunk.split()
-            # 成对处理
             for i in range(0, len(tokens) - 1, 2):
                 main = tokens[i]
                 alias = tokens[i + 1]
                 if main == alias:
                     continue
-                # 仅处理 .1-.9 文件
                 if not re.match(r'^[^.\s]+\.\d+(\.[a-z0-9]+)?$', main):
                     continue
                 if not re.match(r'^[^.\s]+\.\d+(\.[a-z0-9]+)?$', alias):
                     continue
-                # 别名 → 主
                 if alias not in aliases:
                     aliases[alias] = main
     return aliases
 
 
 # ============================================================
-# mdoc 解析器
-# ============================================================
-
-class MdocLine:
-    """一行 mdoc，可能是注释、宏、文本。"""
-    __slots__ = ("raw", "macro", "args", "is_macro", "is_comment", "is_blank")
-
-    def __init__(self, raw: str):
-        self.raw = raw
-        stripped = raw.rstrip("\n")
-        self.is_comment = stripped.startswith(r".\"") or stripped.startswith("\\\"")
-        self.is_blank = (stripped == "")
-        if stripped.startswith(".") and not stripped.startswith(r".\""):
-            # 宏行
-            parts = stripped[1:].split(None, 1)
-            self.macro = parts[0] if parts else ""
-            self.args = parts[1] if len(parts) > 1 else ""
-            self.is_macro = True
-        else:
-            self.macro = ""
-            self.args = stripped
-            self.is_macro = False
-
-
-class MdocParser:
-    """解析 mdoc 文本为 token 流，供渲染器使用。
-
-    解析策略：逐行处理，维护上下文（当前列表、显示块等）。
-    保留 macro 语义，渲染器决定输出。
-    """
-
-    def __init__(self, text: str):
-        self.lines = [MdocLine(l) for l in text.splitlines()]
-
-    def parse(self) -> List[dict]:
-        """返回 token 列表，每个 token 为 dict:
-        {type: 'macro'|'text'|'blank', macro, args, raw}
-        """
-        tokens: List[dict] = []
-        for ln in self.lines:
-            if ln.is_comment:
-                continue
-            if ln.is_blank:
-                tokens.append({"type": "blank"})
-                continue
-            tokens.append({
-                "type": "macro" if ln.is_macro else "text",
-                "macro": ln.macro,
-                "args": ln.args,
-                "raw": ln.raw,
-            })
-        return tokens
-
-
-# ============================================================
-# markdown 渲染器
-# ============================================================
-
-class CrossRefDB:
-    """交叉引用数据库：name+N → 输出路径（相对 SUMMARY）。"""
-
-    def __init__(self):
-        # key: (name_lower, section), value: 相对路径如 man1/man.1.md
-        self.entries: Dict[Tuple[str, int], str] = {}
-        # 别名：alias_lower → (主 name_lower, section)
-        self.alias_map: Dict[str, Tuple[str, int]] = {}
-
-    def register(self, name: str, section: int, rel_path: str) -> None:
-        self.entries[(name.lower(), section)] = rel_path
-
-    def register_alias(self, alias: str, main: str, section: int) -> None:
-        self.alias_map[alias.lower()] = (main.lower(), section)
-
-    def resolve(self, name: str, section: int) -> Optional[str]:
-        """返回相对路径，或 None（不存在）。"""
-        key = (name.lower(), section)
-        if key in self.entries:
-            return self.entries[key]
-        # 查别名
-        a = self.alias_map.get(name.lower())
-        if a and a[1] == section:
-            return self.entries.get(a)
-        return None
-
-
-class MarkdownRenderer:
-    """把 mdoc token 流渲染为 GitBook markdown。
-
-    参考 CLAUDE.md 的 mdoc→markdown 映射规则。
-    """
-
-    def __init__(self, tokens: List[dict], page_name: str, page_section: int,
-                 xref: Optional[CrossRefDB] = None,
-                 current_section: int = 1):
-        self.tokens = tokens
-        self.page_name = page_name  # 命令名（如 man）
-        self.page_section = page_section  # 章节号
-        self.xref = xref or CrossRefDB()
-        self.current_section = current_section  # 当前文件所属章节，用于计算跨章节链接
-        self.out: List[str] = []
-        # 列表栈
-        self.list_stack: List[dict] = []  # 每项 {type, compact, counter}
-        # 显示块栈
-        self.display_stack: List[str] = []  # 'literal'
-        # SYNOPSIS 标志
-        self.in_synopsis = False
-        # 当前章节
-        self.current_sh = ""
-        # 缓冲：SYNOPSIS 整行处理
-        self.synopsis_lines: List[str] = []
-
-    # ---------- 输出辅助 ----------
-    def emit(self, s: str = "") -> None:
-        self.out.append(s)
-
-    def blank(self) -> None:
-        if self.out and self.out[-1] != "":
-            self.out.append("")
-
-    # ---------- macro 参数解析 ----------
-    @staticmethod
-    def split_args(s: str) -> List[str]:
-        """拆分 macro 参数，保留引号内容。"""
-        if not s:
-            return []
-        # 用 shlex 风格拆分，但 mdoc 引号简单
-        args: List[str] = []
-        i = 0
-        n = len(s)
-        while i < n:
-            while i < n and s[i] in " \t":
-                i += 1
-            if i >= n:
-                break
-            if s[i] == '"':
-                i += 1
-                start = i
-                buf = []
-                while i < n and s[i] != '"':
-                    if s[i] == '\\' and i + 1 < n:
-                        buf.append(s[i + 1])
-                        i += 2
-                    else:
-                        buf.append(s[i])
-                        i += 1
-                args.append("".join(buf))
-                if i < n:
-                    i += 1  # 跳过结尾 "
-            else:
-                start = i
-                while i < n and s[i] not in " \t":
-                    i += 1
-                args.append(s[start:i])
-        return args
-
-    # ---------- 内联 macro 渲染 ----------
-    def render_inline(self, s: str) -> str:
-        """渲染内联 macro 文本（可能含多个 macro），返回 markdown 字符串。
-
-        mdoc 内联 macro 以 . 开头，但一行可能有多个（用空格分隔）。
-        本函数处理常见的内联 macro：.Nm .Fl .Ar .Op .Xr .Cd .Va .Vt .Fa
-        .Ic .Li .Em .Sy .Dq .Sq .Ql .Qq .Pq .Fx .Tn .An .Ns .Pa .Ev .Cm .No
-        """
-        if not s:
-            return ""
-        # 按 macro 拆分：macro 以 . 开头后跟字母
-        # 但文本中 . 也可能是普通句点。mdoc 中 macro 总是在行首或紧跟空格后的 .X
-        # 简化：用正则找 \.[A-Z][a-z]+ 模式
-        result: List[str] = []
-        i = 0
-        n = len(s)
-        text_buf: List[str] = []
-
-        def flush_text():
-            if text_buf:
-                result.append("".join(text_buf))
-                text_buf.clear()
-
-        while i < n:
-            # 识别 macro：.后跟大写字母+小写字母
-            m = re.match(r'\.([A-Z][a-z]+)(\s+|$)', s[i:])
-            if m:
-                flush_text()
-                macro = m.group(1)
-                rest_start = i + m.end()
-                # 取该 macro 的参数（直到下一个 macro 或行尾）
-                rest = s[rest_start:]
-                # 找下一个 macro
-                next_m = re.search(r'\s\.([A-Z][a-z]+)(\s+|$)', rest)
-                if next_m:
-                    arg_str = rest[:next_m.start()]
-                    consumed = rest_start + next_m.start()
-                else:
-                    arg_str = rest
-                    consumed = n
-                args = self.split_args(arg_str)
-                result.append(self.render_one_macro(macro, args))
-                i = consumed
-            else:
-                text_buf.append(s[i])
-                i += 1
-        flush_text()
-        return "".join(result)
-
-    def render_one_macro(self, macro: str, args: List[str]) -> str:
-        """渲染单个内联 macro。"""
-        if macro == "Nm":
-            # 名称：用 page_name（无参数时）或参数
-            name = args[0] if args else self.page_name
-            return f"`{name}`"
-        if macro == "Fl":
-            # 选项标志
-            if args:
-                return f"`-{''.join(args)}`"
-            return "`-`"
-        if macro == "Ar":
-            if args:
-                return f"`{' '.join(args)}`"
-            return "`...`"
-        if macro == "Op":
-            # 可选参数 [contents]
-            inner = self.render_inline(" ".join(args))
-            return f"[{inner}]"
-        if macro == "Cm":
-            return f"`{' '.join(args)}`"
-        if macro == "Ic":
-            return f"`{' '.join(args)}`"
-        if macro == "Li":
-            return f"`{' '.join(args)}`"
-        if macro == "Pa":
-            # 路径：项目规范用加粗
-            if args:
-                return f"**{' '.join(args)}**"
-            return "**/**"
-        if macro == "Va":
-            return f"`{' '.join(args)}`"
-        if macro == "Vt":
-            return f"`{' '.join(args)}`"
-        if macro == "Fa":
-            return f"`{' '.join(args)}`"
-        if macro == "Ev":
-            return f"`{' '.join(args)}`"
-        if macro == "Dv":
-            return f"`{' '.join(args)}`"
-        if macro == "Er":
-            return f"`{' '.join(args)}`"
-        if macro == "Cd":
-            return f"`{' '.join(args)}`"
-        if macro == "Em":
-            # 强调：项目规范无斜体，用文本
-            return " ".join(args)
-        if macro == "Sy":
-            # 符号：保留原文
-            return " ".join(args)
-        if macro == "No":
-            # 普通文本
-            return " ".join(args)
-        if macro == "Tn":
-            # 商标：保留英文
-            return " ".join(args)
-        if macro == "Fx":
-            # FreeBSD 版本
-            return f"FreeBSD {' '.join(args)}".strip()
-        if macro == "Nx" or macro == "Ox" or macro == "Bx" or macro == "Bsx":
-            return " ".join(args)
-        if macro == "An":
-            # 作者名：保留英文
-            return " ".join(args)
-        if macro == "Ql":
-            # 引用字面量
-            return f"`{' '.join(args)}`"
-        if macro == "Dq":
-            # 双引号 → 中文引号
-            inner = self.render_inline(" ".join(args))
-            return f"“{inner}”"
-        if macro == "Sq":
-            inner = self.render_inline(" ".join(args))
-            return f"‘{inner}’"
-        if macro == "Qq":
-            inner = self.render_inline(" ".join(args))
-            return f"“{inner}”"
-        if macro == "Pq":
-            # 括号引用
-            inner = self.render_inline(" ".join(args))
-            return f"({inner})"
-        if macro == "Brq":
-            inner = self.render_inline(" ".join(args))
-            return f"{{{inner}}}"
-        if macro == "Ns":
-            # 无空格连接：忽略（前文已直接拼接）
-            return ""
-        if macro == "Xr":
-            # 交叉引用：name section
-            if len(args) >= 2:
-                name = args[0]
-                sec = args[1]
-                try:
-                    sec_n = int(re.match(r'\d+', sec).group(0))
-                except (AttributeError, ValueError):
-                    sec_n = 0
-                link = self.xref.resolve(name, sec_n) if sec_n else None
-                if link:
-                    return f"[{name}({sec})]({link})"
-                return f"{name}({sec})"
-            return " ".join(args)
-        if macro == "Sx":
-            # 章节引用：内部锚点
-            title = " ".join(args)
-            anchor = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')
-            return f"[{title}](#{anchor})"
-        if macro == "Rs":
-            return ""
-        if macro == "%A" or macro == "%T" or macro == "%B" or macro == "%J" \
-                or macro == "%D" or macro == "%I" or macro == "%P" or macro == "%V" \
-                or macro == "%C" or macro == "%N" or macro == "%Q" or macro == "%R":
-            return " ".join(args)
-        # 未知 macro：保留参数
-        return " ".join(args)
-
-    # ---------- 列表处理 ----------
-    def list_open(self, args: List[str]) -> None:
-        """处理 .Bl。"""
-        spec = " ".join(args)
-        entry = {
-            "type": "item",  # 默认
-            "compact": "-compact" in spec,
-            "column": "-column" in spec,
-            "tag": "-tag" in spec,
-            "enum": "-enum" in spec,
-            "hang": "-hang" in spec,
-            "offset": "",
-            "width": "",
-            "counter": 0,
-            "header": [],  # column 表头
-            "rows": [],  # column 行
-        }
-        m = re.search(r'-offset\s+(\S+)', spec)
-        if m:
-            entry["offset"] = m.group(1)
-        m = re.search(r'-width\s+(\S+)', spec)
-        if m:
-            entry["width"] = m.group(1)
-        self.list_stack.append(entry)
-
-    def list_close(self) -> None:
-        """处理 .El。"""
-        if not self.list_stack:
-            return
-        entry = self.list_stack.pop()
-        if entry["column"] and entry["rows"]:
-            self.render_column_table(entry)
-        elif entry["enum"] and not entry["compact"]:
-            # enum 已在 It 时输出
-            pass
-        self.blank()
-
-    def render_column_table(self, entry: dict) -> None:
-        """渲染 -column 列表为 markdown 表格。"""
-        rows = entry["rows"]
-        if not rows:
-            return
-        # 第一行可能是表头
-        header = rows[0]
-        body = rows[1:]
-        ncols = max(len(r) for r in rows)
-        # 补齐
-        for r in rows:
-            while len(r) < ncols:
-                r.append("")
-        # 表头
-        self.emit("| " + " | ".join(header) + " |")
-        self.emit("|" + "|".join(["---"] * ncols) + "|")
-        for r in body:
-            self.emit("| " + " | ".join(r) + " |")
-
-    # ---------- 主渲染 ----------
-    def render(self) -> str:
-        i = 0
-        n = len(self.tokens)
-        while i < n:
-            tok = self.tokens[i]
-            if tok["type"] == "blank":
-                # 段落分隔：不输出连续空行
-                if self.out and self.out[-1] != "" and not self.list_stack:
-                    # 在列表内不随意加空行
-                    pass
-                i += 1
-                continue
-            if tok["type"] == "text":
-                # 纯文本行（在显示块内或列表项内）
-                if self.display_stack:
-                    self.emit(tok["raw"].rstrip())
-                elif self.list_stack:
-                    # 列表项内的续行文本
-                    pass
-                else:
-                    self.emit(self.render_inline(tok["args"]))
-                i += 1
-                continue
-            # macro
-            macro = tok["macro"]
-            args_str = tok["args"]
-            args = self.split_args(args_str)
-
-            if macro == "Dd":
-                # 日期：不输出到正文（由 dates 模块处理）
-                i += 1
-                continue
-            if macro == "Dt":
-                i += 1
-                continue
-            if macro == "Os":
-                i += 1
-                continue
-            if macro == "Sh":
-                title_en = args_str.strip()
-                title_zh = SH_TITLES.get(title_en.upper(), title_en)
-                self.current_sh = title_en.upper()
-                self.in_synopsis = (self.current_sh == "SYNOPSIS")
-                self.blank()
-                # GitBook 风格：## 中文标题
-                self.emit(f"## {title_zh}")
-                self.blank()
-                i += 1
-                continue
-            if macro == "Ss":
-                title = args_str.strip()
-                self.blank()
-                self.emit(f"### {title}")
-                self.blank()
-                i += 1
-                continue
-            if macro == "Nm":
-                # NAME 章节下 .Nm 描述行；SYNOPSIS 下整行处理
-                if self.current_sh == "NAME":
-                    # NAME 章节通常是 .Nm name .Nd desc
-                    # 已在 Nd 处理
-                    pass
-                elif self.in_synopsis:
-                    # SYNOPSIS 行：整行渲染
-                    line = self.render_synopsis_line(tok)
-                    self.emit(line)
-                else:
-                    self.emit(self.render_one_macro("Nm", args))
-                i += 1
-                continue
-            if macro == "Nd":
-                # 名称描述：NAME 章节下，.Nm name .Nd desc → `name` — desc
-                desc = self.render_inline(args_str)
-                # 上一行应是 .Nm
-                self.emit(f"`{self.page_name}` — {desc}")
-                self.blank()
-                i += 1
-                continue
-            if macro == "Pp":
-                self.blank()
-                i += 1
-                continue
-            if macro == "Bl":
-                self.list_open(args)
-                i += 1
-                continue
-            if macro == "El":
-                self.list_close()
-                i += 1
-                continue
-            if macro == "It":
-                self.render_list_item(args_str, args)
-                i += 1
-                continue
-            if macro == "Bd":
-                # 显示块
-                if "-literal" in args_str or "-literal" in " ".join(args):
-                    self.display_stack.append("literal")
-                    self.emit("```sh")
-                elif "-filled" in args_str or "-ragged" in args_str:
-                    self.display_stack.append("filled")
-                else:
-                    self.display_stack.append("block")
-                i += 1
-                continue
-            if macro == "Ed":
-                if self.display_stack:
-                    kind = self.display_stack.pop()
-                    if kind == "literal":
-                        self.emit("```")
-                        self.blank()
-                i += 1
-                continue
-            if macro == "D1":
-                # 单行缩进显示
-                self.emit("```sh")
-                self.emit(self.render_inline(args_str))
-                self.emit("```")
-                self.blank()
-                i += 1
-                continue
-            if macro == "Dl":
-                # 单行字面量
-                self.emit("```sh")
-                self.emit(args_str)
-                self.emit("```")
-                self.blank()
-                i += 1
-                continue
-            if macro == "Ex":
-                # .Ex -std [cmd ...] → 退出状态标准文本
-                # 简化：输出 ".Ex -std" 的常见语义
-                if args and args[0] == "-std":
-                    cmd = args[1] if len(args) > 1 else self.page_name
-                    self.emit(f"`{cmd}` 实用程序在成功时退出状态为 0，失败时退出状态为 1。")
-                else:
-                    self.emit(self.render_inline(args_str))
-                self.blank()
-                i += 1
-                continue
-            if macro == "Rs":
-                # 参考文献开始
-                i += 1
-                continue
-            if macro == "Re":
-                self.blank()
-                i += 1
-                continue
-            if macro == "%A" or macro == "%T" or macro == "%B" or macro == "%J" \
-                    or macro == "%D" or macro == "%I" or macro == "%P" or macro == "%V" \
-                    or macro == "%C" or macro == "%N" or macro == "%Q" or macro == "%R":
-                # 参考文献字段：简化为文本
-                self.emit(self.render_one_macro(macro, args))
-                i += 1
-                continue
-            if macro == "Ta":
-                # 表格列分隔：在 -column 列表项内
-                if self.list_stack and self.list_stack[-1]["column"]:
-                    # 当前行已收集，Ta 分隔
-                    pass
-                i += 1
-                continue
-            if macro == "Sm":
-                # 空格模式：忽略
-                i += 1
-                continue
-            # 未识别 macro：尝试内联渲染
-            rendered = self.render_inline(f".{macro} {args_str}".strip())
-            if rendered.strip():
-                self.emit(rendered)
-            i += 1
-        # 清理多余空行
-        out = "\n".join(self.out)
-        out = re.sub(r'\n{3,}', '\n\n', out)
-        return out.strip() + "\n"
-
-    def render_synopsis_line(self, start_tok: dict) -> str:
-        """渲染 SYNOPSIS 章节的一行（可能跨多个 macro）。"""
-        # SYNOPSIS 中 .Nm 开头的一行，整行用单反引号包裹
-        # 收集本行所有 token（同一原始行的后续 macro）
-        # 简化：只处理当前 token，内联渲染后包裹
-        rendered = self.render_inline(f".{start_tok['macro']} {start_tok['args']}".strip())
-        return f"`{rendered}`"
-
-    def render_list_item(self, args_str: str, args: List[str]) -> None:
-        """处理 .It。"""
-        if not self.list_stack:
-            self.emit(self.render_inline(args_str))
-            return
-        entry = self.list_stack[-1]
-        if entry["column"]:
-            # -column 列表项：一行表格
-            # .It Ta 分隔
-            cells = re.split(r'\s+Ta\s+', args_str)
-            cells = [self.render_inline(c).replace("|", "\\|").strip() for c in cells]
-            entry["rows"].append(cells)
-            return
-        if entry["tag"]:
-            # -tag 列表：.It Fl v → `v` 描述
-            # .It 后第一个 token 是标签
-            head = args_str.split(None, 1)
-            if head:
-                tag_macro = head[0].lstrip(".")
-                tag_args = head[1] if len(head) > 1 else ""
-                # 处理 .It Fl v / .It Cm x / .It Ev X / .It Pa path 等
-                if tag_macro in ("Fl", "Cm", "Ic", "Li", "Va", "Vt", "Fa", "Ev", "Dv", "Er", "Cd", "Ar"):
-                    tag = self.render_one_macro(tag_macro, self.split_args(tag_args))
-                elif tag_macro == "Xr":
-                    xa = self.split_args(tag_args)
-                    tag = self.render_one_macro("Xr", xa)
-                else:
-                    tag = self.render_inline(args_str)
-                self.emit(f"- **{tag}**")
-            else:
-                self.emit("- ")
-            return
-        if entry["enum"]:
-            entry["counter"] += 1
-            self.emit(f"{entry['counter']}. {self.render_inline(args_str)}")
-            return
-        # item / hang
-        self.emit(f"- {self.render_inline(args_str)}")
-        return
-
-
-# ============================================================
-# 转换：单文件
+# mdoc 头部解析（.Dt / .Dd）
 # ============================================================
 
 def parse_header(text: str) -> Tuple[str, int, str]:
@@ -927,51 +305,401 @@ def parse_header(text: str) -> Tuple[str, int, str]:
             if len(parts) >= 2:
                 name = parts[1]
             if len(parts) >= 3:
-                try:
-                    section = int(re.match(r'\d+', parts[2]).group(0))
-                except (AttributeError, ValueError):
-                    pass
+                m = re.match(r'\d+', parts[2])
+                if m:
+                    section = int(m.group(0))
         elif line.startswith(".Dd "):
             date = line[4:].strip()
     return name, section, date
 
 
+def collect_headers(files: List[Path]) -> Dict[Tuple[str, int], Tuple[int, str, str, Path]]:
+    """收集所有文件的头部信息。
+    返回 {(name_lower, section): (section, date, orig_name, src_path)}
+    """
+    db: Dict[Tuple[str, int], Tuple[int, str, str, Path]] = {}
+    for p in files:
+        text = p.read_text(encoding="utf-8", errors="replace")
+        name, section, date = parse_header(text)
+        if not name:
+            name = p.name.split(".")[0]
+        if not section:
+            section = section_from_suffix(p.name) or 1
+        db[(name.lower(), section)] = (section, date, name, p)
+    return db
+
+
+# ============================================================
+# 交叉引用数据库
+# ============================================================
+
+class CrossRefDB:
+    """交叉引用数据库：(name_lower, section) → 输出文件名（如 man.1.md）。"""
+
+    def __init__(self):
+        # key: (name_lower, section), value: 输出文件名（不含路径，如 man.1.md）
+        self.entries: Dict[Tuple[str, int], str] = {}
+
+    def register(self, name: str, section: int, out_filename: str) -> None:
+        self.entries[(name.lower(), section)] = out_filename
+
+    def resolve(self, name: str, section: int, current_section: int) -> Optional[str]:
+        """返回相对链接路径，或 None（不存在）。"""
+        key = (name.lower(), section)
+        if key not in self.entries:
+            return None
+        filename = self.entries[key]
+        if section == current_section:
+            return filename
+        return f"../man{section}/{filename}"
+
+
+# ============================================================
+# mandoc 转换 + 后处理
+# ============================================================
+
+def run_mandoc(src_path: Path, out_path: Path) -> str:
+    """调用 mandoc_convert.exe 转换单个文件，返回 markdown 文本。"""
+    cmd = [str(MANDOC_EXE), str(src_path), str(out_path)]
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=BUILD_DIR)
+    if r.returncode != 0:
+        log(f"  mandoc 警告/错误 ({src_path.name}): {r.stderr[:300]}")
+    if not out_path.exists():
+        raise RuntimeError(f"mandoc 未生成输出：{out_path}")
+    return out_path.read_text(encoding="utf-8", errors="replace")
+
+
+def clean_mandoc_escapes(text: str) -> str:
+    """清理 mandoc -Tmarkdown 的转义字符和 HTML 实体。"""
+    # \[ → [, \] → ]
+    text = text.replace(r'\[', '[').replace(r'\]', ']')
+    # &nbsp; → 空格
+    text = text.replace('&nbsp;', ' ')
+    # \_ → _ （转义下划线还原）
+    text = text.replace(r'\_', '_')
+    # \* → * （转义星号还原）
+    text = text.replace(r'\*', '*')
+    # \` → ` （转义反引号还原）
+    text = text.replace(r'\`', '`')
+    # '`code`' → `code` （去除包裹反引号代码的单引号）
+    text = re.sub(r"'`([^`]+)`'", r'`\1`', text)
+    # \\ → \ （转义反斜杠还原，但保留代码块内的）
+    # 注意：不要在代码块内做这个替换
+    return text
+
+
+def strip_inline_markup(text: str) -> str:
+    """去除内联 markdown 标记（用于 SYNOPSIS 代码块）。
+    **bold** → bold, *italic* → italic, `code` → code
+    """
+    # `code` → code
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    # **bold** → bold
+    text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+    # *italic* → italic
+    text = re.sub(r'\*([^*]+)\*', r'\1', text)
+    # 去除行尾两个空格（markdown 硬换行）
+    text = text.rstrip(' \t')
+    return text
+
+
+def is_synopsis_command_start(line: str, cmd_lower: str) -> bool:
+    """判断一行是否是 SYNOPSIS 中的命令名开头（如 **man**）。"""
+    # mandoc 输出 **man** 或 *man*
+    stripped = line.strip()
+    if stripped.startswith('**'):
+        # 提取 **xxx** 的 xxx
+        m = re.match(r'\*\*([^*]+)\*\*', stripped)
+        if m and m.group(1).lower() == cmd_lower:
+            return True
+    if stripped.startswith('*'):
+        m = re.match(r'\*([^*]+)\*', stripped)
+        if m and m.group(1).lower() == cmd_lower:
+            return True
+    return False
+
+
+def process_synopsis(lines: List[str], start_idx: int, display_name: str,
+                     xref: CrossRefDB, section: int) -> Tuple[List[str], int]:
+    """处理 SYNOPSIS 章节，返回 (处理后的行列表, 下一个未处理行的索引)。"""
+    out: List[str] = []
+    cmd_lower = display_name.lower()
+    # 收集 SYNOPSIS 内的所有非空行（直到下一个 ## 标题）
+    synopsis_lines: List[str] = []
+    i = start_idx
+    while i < len(lines):
+        line = lines[i]
+        # 遇到下一个 ## 标题，结束
+        if line.startswith('## ') or line.startswith('# '):
+            break
+        synopsis_lines.append(line)
+        i += 1
+
+    # 解析命令行：每个 **man** 开头为新命令行
+    commands: List[List[str]] = []  # 每个元素是一个命令的所有行
+    current_cmd: List[str] = []
+    for ln in synopsis_lines:
+        stripped = ln.strip()
+        if not stripped:
+            # 空行：如果当前有命令，结束当前命令
+            if current_cmd:
+                commands.append(current_cmd)
+                current_cmd = []
+            continue
+        if is_synopsis_command_start(stripped, cmd_lower):
+            # 新命令开始
+            if current_cmd:
+                commands.append(current_cmd)
+            current_cmd = [stripped]
+        else:
+            if current_cmd:
+                current_cmd.append(stripped)
+            else:
+                # SYNOPSIS 中命令名前的行（罕见），单独作为命令
+                current_cmd = [stripped]
+    if current_cmd:
+        commands.append(current_cmd)
+
+    # 每个命令合并为一行，用反引号包裹
+    for cmd_lines in commands:
+        merged = ' '.join(cmd_lines)
+        # 清理 markdown 标记
+        cleaned = strip_inline_markup(merged)
+        # 清理转义
+        cleaned = clean_mandoc_escapes(cleaned)
+        # 清理多余空格
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        if cleaned:
+            out.append(f'`{cleaned}`')
+            out.append('')
+
+    return out, i
+
+
+def post_process(md: str, display_name: str, section: int,
+                 xref: CrossRefDB) -> str:
+    """后处理 mandoc markdown 输出，使格式接近传统 man 渲染效果。
+
+    处理步骤：
+    1. 替换首行标题为 `# name(N)` 小写
+    2. 降级标题层级（# → ##，## → ###）
+    3. 清理转义字符（\\[, \\], &nbsp;, \\_, \\*）
+    4. SYNOPSIS 章节合并为代码块（反引号包裹的命令行）
+    5. 路径斜体改为加粗（*/path* → **/path**）
+    6. 交叉引用 name(N) 链接化
+    7. 去除页脚行
+    8. 合并断行的内联标记（**cmd**\\n → **cmd** ）
+    """
+    lines = md.splitlines()
+    out: List[str] = []
+    in_code_block = False
+    skipped_title = False
+    skipped_footer = False
+    current_section_header = ""  # 当前 ## 章节标题（大写）
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # 代码块状态跟踪
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            out.append(line)
+            i += 1
+            continue
+
+        # 首行标题：mandoc 输出 "MAN(1) - FreeBSD General Commands Manual"
+        if not skipped_title and not in_code_block:
+            if re.match(r'^[A-Z][A-Z0-9._-]*\(\d+\)\s*-\s*FreeBSD', line):
+                out.append(f"# {display_name.lower()}({section})")
+                out.append("")
+                skipped_title = True
+                i += 1
+                continue
+            if i == 0:
+                out.append(f"# {display_name.lower()}({section})")
+                out.append("")
+                skipped_title = True
+                # 不 continue，继续处理这行
+
+        # 页脚行：mandoc 输出 "W  - January 24, 2025 - MAN(1)" 或类似
+        if not in_code_block and not skipped_footer:
+            if re.match(r'^[A-Z]\s+-\s+\w+\s+\d+,?\s+\d+\s+-\s+[A-Z]', line):
+                skipped_footer = True
+                i += 1
+                continue
+
+        # 降级标题层级（仅在非代码块内）
+        if not in_code_block and line.startswith("#"):
+            # 检测 SYNOPSIS 章节（mandoc 输出 # SYNOPSIS，降级后为 ## SYNOPSIS）
+            if re.match(r'^#\s+SYNOPSIS\s*$', line):
+                current_section_header = "SYNOPSIS"
+                out.append("## SYNOPSIS")
+                out.append("")
+                # 处理 SYNOPSIS 内容
+                syn_out, next_i = process_synopsis(
+                    lines, i + 1, display_name, xref, section)
+                out.extend(syn_out)
+                i = next_i
+                continue
+            # 其他标题：记录当前章节
+            m = re.match(r'^#+\s+(.+)$', line)
+            if m:
+                current_section_header = m.group(1).upper()
+            line = "#" + line
+
+        # 非代码块内：清理转义和格式
+        if not in_code_block:
+            # 清理转义字符
+            line = clean_mandoc_escapes(line)
+            # 路径斜体改加粗：*/path* → **/path**
+            # 匹配 *...* 其中包含 / 的（路径）
+            line = re.sub(r'\*([^\*]*/[^\*]*)\*', r'**\1**', line)
+            # 交叉引用链接化
+            line = linkify_xref(line, section, xref)
+
+        out.append(line)
+        i += 1
+
+    result = "\n".join(out)
+    # 合并有序列表的断行续行：如 "1.\tFreeBSD\n\tGeneral Commands Manual"
+    # mandoc 输出格式：行尾为 \t 分隔，续行用 \t 缩进
+    result = merge_list_continuations(result)
+    # 清理多余空行
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    return result.strip() + "\n"
+
+
+def merge_list_continuations(text: str) -> str:
+    """合并有序/无序列表的断行续行。
+
+    mandoc 输出：
+        1.\tFreeBSD
+        \tGeneral Commands Manual
+    合并为：
+        1. FreeBSD General Commands Manual
+    """
+    lines = text.split('\n')
+    out: List[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # 检测有序列表项：N.\t 或 N.  开头
+        m = re.match(r'^(\d+)\.\t(.+)$', line)
+        if m:
+            # 收集续行（以 \t 开头的行）
+            parts = [m.group(2)]
+            j = i + 1
+            while j < len(lines) and lines[j].startswith('\t'):
+                parts.append(lines[j].strip('\t'))
+                j += 1
+            out.append(f"{m.group(1)}. {' '.join(parts)}")
+            i = j
+            continue
+        # 检测无序列表项续行（- 或 * 开头后的 \t 续行）
+        m2 = re.match(r'^(-|\*)\t(.+)$', line)
+        if m2:
+            parts = [m2.group(2)]
+            j = i + 1
+            while j < len(lines) and lines[j].startswith('\t'):
+                parts.append(lines[j].strip('\t'))
+                j += 1
+            out.append(f"{m2.group(1)} {' '.join(parts)}")
+            i = j
+            continue
+        out.append(line)
+        i += 1
+    return '\n'.join(out)
+
+
+def linkify_xref(line: str, current_section: int, xref: CrossRefDB) -> str:
+    """将行内的 name(N) 交叉引用转换为 markdown 链接。
+
+    跳过已在链接 [](...  内的、在代码 ` 内的引用。
+    """
+    # name(N) 模式：name 为字母数字+._-，N 为数字+可选字母（如 3lua）
+    pattern = re.compile(r'(?<![\w\[\(])(([A-Za-z][\w.-]*)\((\d[a-z]*)\))')
+
+    def replace(m: re.Match) -> str:
+        full = m.group(1)   # name(N)
+        name = m.group(2)   # name
+        sec_str = m.group(3)  # N
+        # 解析章节号
+        sm = re.match(r'(\d+)', sec_str)
+        if not sm:
+            return full
+        sec = int(sm.group(1))
+        link = xref.resolve(name, sec, current_section)
+        if link:
+            return f"[{full}]({link})"
+        return full
+
+    # 分段处理：跳过 `code` 和 [link](url) 区域
+    result: List[str] = []
+    i = 0
+    n = len(line)
+    while i < n:
+        # 跳过行内代码 `...`
+        if line[i] == '`':
+            j = line.find('`', i + 1)
+            if j != -1:
+                result.append(line[i:j + 1])
+                i = j + 1
+                continue
+        # 跳过链接 [text](url)
+        if line[i] == '[':
+            j = line.find(']', i + 1)
+            if j != -1 and j + 1 < n and line[j + 1] == '(':
+                k = line.find(')', j + 2)
+                if k != -1:
+                    result.append(line[i:k + 1])
+                    i = k + 1
+                    continue
+        # 找下一个 ` 或 [（从 i+1 开始，避免停在当前位置死循环）
+        next_special = min(
+            (p for p in [line.find('`', i + 1), line.find('[', i + 1)] if p != -1),
+            default=n
+        )
+        chunk = line[i:next_special]
+        result.append(pattern.sub(replace, chunk))
+        i = next_special
+    return "".join(result)
+
+
+# ============================================================
+# 转换：单文件
+# ============================================================
+
 def convert_one(src_path: Path, out_dir: Path, xref: CrossRefDB,
-                alias_name: Optional[str] = None) -> Path:
+                alias_name: Optional[str] = None) -> Tuple[Path, str, int, str]:
     """转换单个 mdoc 文件为 markdown。
     alias_name: 若为别名，用此名作为标题与输出文件名。
-    返回输出文件路径。
+    返回 (输出路径, 显示名, 章节, 日期)。
     """
     text = src_path.read_text(encoding="utf-8", errors="replace")
     name, section, date = parse_header(text)
     if not name:
-        # 从文件名推导
         name = src_path.name.split(".")[0]
     if not section:
         section = section_from_suffix(src_path.name) or 1
 
     display_name = alias_name or name
-    # 输出文件名：小写，命令.N.md
     out_name = f"{safe_filename(display_name)}.{section}.md"
     out_path = out_dir / out_name
+    tmp_path = out_dir / f".{out_name}.tmp"
 
-    tokens = MdocParser(text).parse()
-    renderer = MarkdownRenderer(tokens, display_name, section, xref, section)
-    body = renderer.render()
+    # 调用 mandoc 转换
+    run_mandoc(src_path, tmp_path)
+    md = tmp_path.read_text(encoding="utf-8", errors="replace")
 
-    # 标题：别名用别名，否则用 name(section)
-    title = f"{display_name}({section})"
-    content = f"# {title}\n\n{body}"
+    # 后处理
+    processed = post_process(md, display_name, section, xref)
+    out_path.write_text(processed, encoding="utf-8")
 
-    # 提取日期/版本信息
-    out_path.write_text(content, encoding="utf-8")
-    return out_path
-
-
-def collect_dates(src_path: Path) -> Tuple[str, int, str]:
-    """返回 (name, section, date)。"""
-    text = src_path.read_text(encoding="utf-8", errors="replace")
-    return parse_header(text)
+    # 清理临时文件
+    tmp_path.unlink(missing_ok=True)
+    return out_path, display_name, section, date
 
 
 # ============================================================
@@ -981,19 +709,18 @@ def collect_dates(src_path: Path) -> Tuple[str, int, str]:
 def build_summary(entries: List[dict]) -> str:
     """生成 SUMMARY.md 内容。
     entries: [{section, name, rel_path, group?}]
-    group: man2/man3 的子目录分组名（如 string, stdio）
+    group: man2/man3 的子目录分组名
     """
     lines = ["# Table of contents", "", "* [man 页](README.md)", "* [目录](mu-lu.md)", ""]
-    # 按章节分组
     by_sec: Dict[int, List[dict]] = {}
     for e in entries:
         by_sec.setdefault(e["section"], []).append(e)
+
     for sec in sorted(by_sec.keys()):
         title = SECTION_TITLES.get(sec, f"man{sec}")
         lines.append(f"## {title}")
         lines.append("")
         items = sorted(by_sec[sec], key=lambda x: (x.get("group", ""), x["name"].lower()))
-        # man2/man3 按 group 分组
         if sec in (2, 3):
             groups: Dict[str, List[dict]] = {}
             for e in items:
@@ -1017,30 +744,31 @@ def build_summary(entries: List[dict]) -> str:
 # 清理集成（AutoCorrect / md-padding）
 # ============================================================
 
-def run_cleaners_check(target_dir: Path) -> None:
+def run_cleaners_check() -> None:
     """运行 AutoCorrect 和 md-padding 的差异检查（不修改文件）。
     输出差异报告到 script/ 下供人工逐条复核。
     """
     report_dir = ROOT / "script"
-    report_dir.mkdir(exist_ok=True)
-    patterns = ['"**/*.md"', f'"{target_dir.relative_to(ROOT)}/**"']
+    target_dirs = [EN_DIR / f"man{n}" for n in range(1, 10)
+                   if (EN_DIR / f"man{n}").exists()]
+    targets = " ".join(f'"{d}"' for d in target_dirs)
     # AutoCorrect
     ac_report = report_dir / "autocorrect_report.txt"
     try:
         r = subprocess.run(
-            ["autocorrect", "--lint", str(target_dir)],
-            capture_output=True, text=True, cwd=ROOT
+            f'autocorrect --lint {targets}',
+            shell=True, capture_output=True, text=True, cwd=ROOT
         )
         ac_report.write_text(r.stdout + r.stderr, encoding="utf-8")
         log(f"AutoCorrect 报告：{ac_report}")
     except FileNotFoundError:
-        log("AutoCorrect 未安装，跳过（安装：cargo install autocorrect 或 npm i -g autocorrect）")
+        log("AutoCorrect 未安装，跳过（安装：cargo install autocorrect）")
     # md-padding
     mdp_report = report_dir / "mdpadding_report.txt"
     try:
         r = subprocess.run(
-            ["md-padding", "--check", str(target_dir)],
-            capture_output=True, text=True, cwd=ROOT
+            f'md-padding --check {targets}',
+            shell=True, capture_output=True, text=True, cwd=ROOT
         )
         mdp_report.write_text(r.stdout + r.stderr, encoding="utf-8")
         log(f"md-padding 报告：{mdp_report}")
@@ -1049,108 +777,150 @@ def run_cleaners_check(target_dir: Path) -> None:
 
 
 # ============================================================
-# 主入口
+# 主入口：preview
 # ============================================================
 
 def cmd_preview(name: str) -> None:
     """预览模式：仅转换指定名称的 man 页面（如 man, cat, ls）。"""
-    extract_zip()
-    files = scan_man_files()
-    target = None
-    for p in files:
-        stem = p.name.split(".")[0]
-        if stem.lower() == name.lower():
-            target = p
+    ensure_mandoc()
+
+    # 尝试在 zip 中直接查找（避免全量解压）
+    section = 1
+    zip_path = None
+    for sec in range(1, 10):
+        p = find_man_in_zip(name, sec)
+        if p:
+            section = sec
+            zip_path = p
             break
-    if not target:
-        log(f"未找到 {name} 的 man 页面")
-        sys.exit(1)
-    log(f"转换 {target} 预览...")
+
+    if zip_path:
+        log(f"在 zip 中找到：{zip_path}")
+        # 仅解压该文件
+        with zipfile.ZipFile(ZIP_PATH) as zf:
+            zf.extract(zip_path, EN_DIR)
+        src_path = EN_DIR / zip_path
+    else:
+        # 全量解压后扫描
+        extract_zip()
+        files = scan_man_files()
+        src_path = None
+        for p in files:
+            stem = p.name.split(".")[0]
+            if stem.lower() == name.lower():
+                src_path = p
+                section = section_from_suffix(p.name) or 1
+                break
+        if not src_path:
+            log(f"未找到 {name} 的 man 页面")
+            sys.exit(1)
+
+    log(f"转换 {src_path.name} 预览...")
+
+    # 构建 xref（预览模式：仅注册自身 + 常见页面）
     xref = CrossRefDB()
-    # 预览模式：xref 仅注册自身
-    section = section_from_suffix(target.name) or 1
+    out_filename = f"{safe_filename(name)}.{section}.md"
+    xref.register(name, section, out_filename)
+
     out_dir = EN_DIR / f"man{section}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    # README.md for man2/man3
     if section in (2, 3):
         readme = out_dir / "README.md"
         if not readme.exists():
             readme.write_text(f"# man{section}\n", encoding="utf-8")
-    out_path = convert_one(target, out_dir, xref)
-    log(f"已生成：{out_path}")
-    log("预览内容前 60 行：")
-    print("\n".join(out_path.read_text(encoding="utf-8").splitlines()[:60]))
 
+    out_path, display_name, sec, date = convert_one(src_path, out_dir, xref)
+    log(f"已生成：{out_path}")
+    log(f"标题：{display_name}({sec})，日期：{date}")
+    log("预览内容前 80 行：")
+    print("\n".join(out_path.read_text(encoding="utf-8").splitlines()[:80]))
+
+
+# ============================================================
+# 主入口：all
+# ============================================================
 
 def cmd_all() -> None:
     """全量转换。"""
+    ensure_mandoc()
     extract_zip()
     files = scan_man_files()
     log(f"发现 {len(files)} 个 man 页面源文件")
     aliases = parse_mlinks()
     log(f"发现 {len(aliases)} 个 MLINKS 别名")
-    # 构建交叉引用库
+
+    # 收集所有头部信息，构建交叉引用库
+    headers = collect_headers(files)
     xref = CrossRefDB()
+    for (nl, sec), (_, _, orig_name, _) in headers.items():
+        xref.register(orig_name, sec, f"{safe_filename(orig_name)}.{sec}.md")
+    # 注册别名
+    for alias_file, main_file in aliases.items():
+        am = re.match(r'^([^.\s]+)\.(\d+)', alias_file)
+        mm = re.match(r'^([^.\s]+)\.(\d+)', main_file)
+        if am and mm:
+            alias_name = am.group(1)
+            main_name = mm.group(1)
+            sec = int(mm.group(2))
+            xref.register(alias_name, sec, f"{safe_filename(alias_name)}.{sec}.md")
+
     summary_entries: List[dict] = []
-    dates_data: Dict[int, List[Tuple[str, str]]] = {}  # section -> [(name, date)]
-    # 先注册所有主文件
-    for p in files:
-        name, section, date = collect_dates(p)
-        if not name:
-            continue
-        rel = f"man{section}/{safe_filename(name)}.{section}.md"
-        xref.register(name, section, rel)
-        # 注册别名
-    for alias, main in aliases.items():
-        m = re.match(r'^([^.\s]+)\.(\d+)', main)
-        a = re.match(r'^([^.\s]+)\.(\d+)', alias)
-        if m and a:
-            xref.register_alias(a.group(1), m.group(1), int(m.group(2)))
+    dates_data: Dict[int, List[Tuple[str, str]]] = {}
+    alias_entries: List[Tuple[str, str, int]] = []
+
     # 转换主文件
+    converted = 0
     for p in files:
-        name, section, date = collect_dates(p)
+        name, section, date = parse_header(
+            p.read_text(encoding="utf-8", errors="replace"))
         if not name:
-            continue
+            name = p.name.split(".")[0]
+        if not section:
+            section = section_from_suffix(p.name) or 1
         out_dir = EN_DIR / f"man{section}"
         out_dir.mkdir(parents=True, exist_ok=True)
-        # man2/man3 子目录分组（基于源路径，如 lib/libc/string/strcpy.3 → group=string）
+
+        # man2/man3 子目录分组
         group = ""
         if section in (2, 3):
             rel = p.relative_to(SRC_DIR).as_posix()
-            # 提取 lib/libX/<group>/ 中的 group
             gm = re.match(r'lib/[^/]+/([^/]+)/', rel)
             if gm:
                 group = gm.group(1)
+
         try:
             convert_one(p, out_dir, xref)
+            converted += 1
+            if converted % 50 == 0:
+                log(f"  已转换 {converted}/{len(files)}...")
         except Exception as e:
             log(f"转换失败 {p}: {e}")
             continue
+
         rel_path = f"en/man{section}/{safe_filename(name)}.{section}.md"
-        # SUMMARY 路径相对根目录
         summary_entries.append({
             "section": section, "name": name, "rel_path": rel_path, "group": group
         })
         dates_data.setdefault(section, []).append((name, date))
+
+    log(f"主文件转换完成：{converted}/{len(files)}")
+
     # 转换别名（重复内容，标题用别名）
-    alias_entries: List[Tuple[str, str, int]] = []  # (alias, main, section)
-    for alias, main in aliases.items():
-        m = re.match(r'^([^.\s]+)\.(\d+)', main)
-        a = re.match(r'^([^.\s]+)\.(\d+)', alias)
-        if not (m and a):
+    for alias_file, main_file in aliases.items():
+        mm = re.match(r'^([^.\s]+)\.(\d+)', main_file)
+        am = re.match(r'^([^.\s]+)\.(\d+)', alias_file)
+        if not (mm and am):
             continue
-        main_name = m.group(1)
-        sec = int(m.group(2))
+        main_name = mm.group(1)
+        sec = int(mm.group(2))
         # 找主文件源路径
         main_src = None
-        for p in files:
-            if p.name.split(".")[0].lower() == main_name.lower() and \
-               section_from_suffix(p.name) == sec:
-                main_src = p
-                break
+        key = (main_name.lower(), sec)
+        if key in headers:
+            main_src = headers[key][3]
         if not main_src:
             continue
-        alias_name = a.group(1)
+        alias_name = am.group(1)
         out_dir = EN_DIR / f"man{sec}"
         out_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -1163,29 +933,50 @@ def cmd_all() -> None:
             "section": sec, "name": alias_name, "rel_path": rel_path, "group": ""
         })
         alias_entries.append((alias_name, main_name, sec))
-    log(f"转换完成：{len(summary_entries)} 个条目")
-    # 生成 SUMMARY.md
+
+    log(f"别名转换完成：{len(alias_entries)} 个")
+
+    # 生成 SUMMARY.md（根目录，指向 en/manN/）
     SUMMARY_FILE.write_text(build_summary(summary_entries), encoding="utf-8")
-    log(f"已生成 {SUMMARY_FILE}")
+    log(f"已生成 {SUMMARY_FILE}（{len(summary_entries)} 条）")
+
+    # 生成 en/SUMMARY.md（英文项目内部 TOC，路径不带 en/ 前缀）
+    en_entries = []
+    for e in summary_entries:
+        en_entries.append({
+            "section": e["section"], "name": e["name"],
+            "rel_path": e["rel_path"].removeprefix("en/"), "group": e.get("group", "")
+        })
+    EN_SUMMARY_FILE.write_text(build_summary(en_entries), encoding="utf-8")
+    log(f"已生成 {EN_SUMMARY_FILE}")
+
     # 生成 .github/aliases.txt
     GITHUB_DIR.mkdir(exist_ok=True)
     with open(ALIASES_FILE, "w", encoding="utf-8") as f:
         for alias, main, sec in sorted(alias_entries):
             f.write(f"{alias}|{main}|{sec}\n")
     log(f"已生成 {ALIASES_FILE}（{len(alias_entries)} 条）")
+
     # 生成 .github/dates/
     DATES_DIR.mkdir(parents=True, exist_ok=True)
     for sec, items in dates_data.items():
         with open(DATES_DIR / f"man{sec}.txt", "w", encoding="utf-8") as f:
-            for name, date in sorted(items):
-                f.write(f"{name}\t{date}\n")
+            for nm, dt in sorted(items):
+                f.write(f"{nm}\t{dt}\n")
     log(f"已生成 {DATES_DIR}")
+
     # man2/man3 README.md
     for sec in (2, 3):
         readme = EN_DIR / f"man{sec}" / "README.md"
         if not readme.exists():
             readme.write_text(f"# man{sec}\n", encoding="utf-8")
 
+    log("全部完成！")
+
+
+# ============================================================
+# 主入口：summary（仅重新生成 SUMMARY.md）
+# ============================================================
 
 def cmd_summary() -> None:
     """仅重新生成 SUMMARY.md（基于已有 en/manN/ 目录）。"""
@@ -1195,6 +986,8 @@ def cmd_summary() -> None:
         if not d.exists():
             continue
         for p in sorted(d.glob(f"*.{sec}.md")):
+            if p.name == "README.md":
+                continue
             name = p.stem.rsplit(".", 1)[0]
             rel = f"en/man{sec}/{p.name}"
             entries.append({"section": sec, "name": name, "rel_path": rel, "group": ""})
@@ -1202,10 +995,18 @@ def cmd_summary() -> None:
     log(f"已重新生成 {SUMMARY_FILE}（{len(entries)} 条）")
 
 
+# ============================================================
+# 主入口：clean
+# ============================================================
+
 def cmd_clean() -> None:
     """运行清理差异报告。"""
-    run_cleaners_check(EN_DIR)
+    run_cleaners_check()
 
+
+# ============================================================
+# main
+# ============================================================
 
 def main() -> None:
     if len(sys.argv) < 2:
@@ -1224,13 +1025,13 @@ def main() -> None:
     elif cmd == "clean":
         cmd_clean()
     elif cmd == "dates":
-        # 仅重新生成 dates
         extract_zip()
         files = scan_man_files()
         DATES_DIR.mkdir(parents=True, exist_ok=True)
         by_sec: Dict[int, List[Tuple[str, str]]] = {}
         for p in files:
-            name, section, date = collect_dates(p)
+            name, section, date = parse_header(
+                p.read_text(encoding="utf-8", errors="replace"))
             if name and section:
                 by_sec.setdefault(section, []).append((name, date))
         for sec, items in by_sec.items():
@@ -1245,10 +1046,10 @@ def main() -> None:
         with open(ALIASES_FILE, "w", encoding="utf-8") as f:
             for alias in sorted(aliases.keys()):
                 main = aliases[alias]
-                m = re.match(r'^([^.\s]+)\.(\d+)', main)
-                a = re.match(r'^([^.\s]+)\.(\d+)', alias)
-                if m and a:
-                    f.write(f"{a.group(1)}|{m.group(1)}|{m.group(2)}\n")
+                mm = re.match(r'^([^.\s]+)\.(\d+)', main)
+                am = re.match(r'^([^.\s]+)\.(\d+)', alias)
+                if mm and am:
+                    f.write(f"{am.group(1)}|{mm.group(1)}|{mm.group(2)}\n")
         log(f"已生成 {ALIASES_FILE}（{len(aliases)} 条）")
     else:
         print(f"未知命令：{cmd}")
