@@ -378,7 +378,10 @@ def clean_mandoc_escapes(text: str) -> str:
     # HTML 数字实体清理
     text = text.replace('&#160;', ' ')   # 不间断空格
     text = text.replace('&#45;', '-')    # 连字符
+    text = text.replace('&#46;', '.')    # 句点
     text = text.replace('&#92;', '\\')   # 反斜杠
+    text = text.replace('&#39;', "'")    # 撇号
+    text = text.replace('&#96;', '`')    # 反引号
     text = text.replace('&#8220;', '"')  # 左双引号
     text = text.replace('&#8221;', '"')  # 右双引号
     text = text.replace('&#8216;', "'")  # 左单引号
@@ -386,6 +389,16 @@ def clean_mandoc_escapes(text: str) -> str:
     text = text.replace('&#8203;', '')   # 零宽空格
     text = text.replace('&#8204;', '')   # 零宽不连字 (zwnj)
     text = text.replace('&zwnj;', '')    # 零宽不连字命名实体
+    # 数学符号实体
+    text = text.replace('&#8804;', '≤')  # 小于等于
+    text = text.replace('&#8805;', '≥')  # 大于等于
+    text = text.replace('&#8800;', '≠')  # 不等于
+    text = text.replace('&#215;', '×')   # 乘号
+    text = text.replace('&#247;', '÷')   # 除号
+    text = text.replace('&#8594;', '→')  # 右箭头
+    text = text.replace('&#8592;', '←')  # 左箭头
+    text = text.replace('&#8593;', '↑')  # 上箭头
+    text = text.replace('&#8595;', '↓')  # 下箭头
     # &gt; → >, &lt; → <, &amp; → &, &quot; → "
     text = text.replace('&gt;', '>').replace('&lt;', '<')
     text = text.replace('&amp;', '&').replace('&quot;', '"')
@@ -397,7 +410,9 @@ def clean_mandoc_escapes(text: str) -> str:
     text = text.replace(r'\`', '`')
     # 转义点号还原：4\.4BSD → 4.4BSD
     text = text.replace(r'\.', '.')
-    # '`code`' → `code` （去除包裹反引号代码的单引号）
+    # \-- → -- （转义连字符还原）
+    text = text.replace(r'\--', '--')
+    # \`code\` → `code` （去除包裹反引号代码的单引号）
     text = re.sub(r"'`([^`]+)`'", r'`\1`', text)
     # 反引号代码内的斜体标记去除：`sysctl *hw.machine_arch*` → `sysctl hw.machine_arch`
     def deitalicize_code(m: re.Match) -> str:
@@ -443,15 +458,22 @@ def is_synopsis_command_start(line: str, cmd_lower: str) -> bool:
 
 def process_synopsis(lines: List[str], start_idx: int, display_name: str,
                      xref: CrossRefDB, section: int) -> Tuple[List[str], int]:
-    """处理 SYNOPSIS 章节，返回 (处理后的行列表, 下一个未处理行的索引)。"""
+    """处理 SYNOPSIS 章节，返回 (处理后的行列表, 下一个未处理行的索引)。
+
+    mandoc 原始输出特征：
+    - .Bd -literal 块 → tab 缩进的纯文本行
+    - .Bd -ragged + .Cd 块 → > 前缀的加粗行（如 > **device iflib**）
+    - C 函数声明 → **#include** / *int* / **func**() 等加粗/斜体标记
+    - 命令行 → **cmd** [-options] [args] 等加粗标记
+    - 描述文字 → 纯文本行（如 "To compile this driver..."）
+    """
     out: List[str] = []
     cmd_lower = display_name.lower()
-    # 收集 SYNOPSIS 内的所有非空行（直到下一个 ## 标题）
+    # 收集 SYNOPSIS 内的所有行（直到下一个 ## 标题）
     synopsis_lines: List[str] = []
     i = start_idx
     while i < len(lines):
         line = lines[i]
-        # 遇到下一个 ## 标题，结束
         if line.startswith('## ') or line.startswith('# '):
             break
         synopsis_lines.append(line)
@@ -459,26 +481,31 @@ def process_synopsis(lines: List[str], start_idx: int, display_name: str,
 
     # 判断 SYNOPSIS 类型：
     # - C 函数声明型（man2/man3/man9）：含 #include 或函数声明（int/void/char * 等）
+    # - 混合型（man4 驱动）：含 tab 缩进的 .Bd -literal 块 或 > 前缀的 .Cd 块
     # - 命令行型（man1/man5/man8）：以 **cmd** 开头
-    # mandoc 输出 C 代码时用加粗/斜体标记：**#include ...**, *int*, **func**()
     is_c_synopsis = False
+    has_literal_block = False  # 含 .Bd -literal 的 tab 缩进块
+    has_cd_block = False       # 含 .Cd 的 > 前缀块
     for ln in synopsis_lines:
         s = ln.strip()
-        # 去除 markdown 标记后检测
         plain = strip_inline_markup(s)
         plain = clean_mandoc_escapes(plain)
         plain = plain.replace('`', '').strip()
         if plain.startswith('#include'):
             is_c_synopsis = True
             break
-        # 检测 C 函数声明特征：类型 + 函数名/指针
         if re.match(r'^(int|void|char\s*\*?|size_t|ssize_t|long|unsigned|struct|enum|const|uint\w+|int\w+|u_\w+|u_int\w*|__\w+)\s', plain):
             is_c_synopsis = True
             break
-        # 检测 #define / #ifdef 等预处理指令
         if plain.startswith('#') and not plain.startswith('#!'):
             is_c_synopsis = True
             break
+        # 检测 tab 缩进的 .Bd -literal 块
+        if ln.startswith('\t') or ln.startswith('        '):
+            has_literal_block = True
+        # 检测 > 前缀的 .Cd 块
+        if ln.startswith('>'):
+            has_cd_block = True
 
     if is_c_synopsis:
         # C 函数声明：用三反引号代码块，保持多行结构
@@ -487,24 +514,14 @@ def process_synopsis(lines: List[str], start_idx: int, display_name: str,
             stripped = ln.strip()
             if not stripped:
                 continue
-            # C 代码清理：先还原转义，再去除 markdown 标记
-            # mandoc 输出 **bold**, *italic*, \`code\`, \* (转义星号/C指针)
             cleaned = stripped
-            # 还原转义星号为占位符（C 指针 *）
             cleaned = cleaned.replace(r'\*', '\x00STAR\x00')
-            # 还原转义下划线
             cleaned = cleaned.replace(r'\_', '_')
-            # 去除 **bold** → bold
             cleaned = re.sub(r'\*\*([^*]+)\*\*', r'\1', cleaned)
-            # 去除 *italic* → italic
             cleaned = re.sub(r'\*([^*]+)\*', r'\1', cleaned)
-            # 去除 `code` → code
             cleaned = re.sub(r'`([^`]+)`', r'\1', cleaned)
-            # 还原 HTML 实体
             cleaned = clean_mandoc_escapes(cleaned)
-            # 还原占位符为 *
             cleaned = cleaned.replace('\x00STAR\x00', '*')
-            # 压缩行内多余空格
             cleaned = re.sub(r' {2,}', ' ', cleaned).strip()
             if cleaned:
                 code_lines.append(cleaned)
@@ -513,6 +530,13 @@ def process_synopsis(lines: List[str], start_idx: int, display_name: str,
             out.extend(code_lines)
             out.append('```')
             out.append('')
+    elif has_literal_block or has_cd_block:
+        # 混合型（man4 驱动等）：保留结构，逐段处理
+        # - 纯文本行 → 保留
+        # - tab 缩进块（.Bd -literal）→ ```sh 代码围栏
+        # - > 前缀块（.Cd in .Bd -ragged）→ 去除 > 和 **，转为 `device xxx`
+        # - 命令行（**cmd** 开头）→ 单行反引号包裹
+        out.extend(_process_mixed_synopsis(synopsis_lines, cmd_lower))
     else:
         # 命令行型：每个 **cmd** 开头为新命令行，合并为单行反引号
         commands: List[List[str]] = []
@@ -548,6 +572,132 @@ def process_synopsis(lines: List[str], start_idx: int, display_name: str,
     return out, i
 
 
+def _process_mixed_synopsis(synopsis_lines: List[str], cmd_lower: str) -> List[str]:
+    """处理混合型 SYNOPSIS（含 .Bd -literal / .Bd -ragged / .Cd 的 man4 驱动等）。
+
+    返回处理后的行列表。逐行分析：
+    - tab/8空格缩进连续行 → ```sh 代码围栏
+    - > 前缀的 **xxx** 行（.Cd 宏）→ 去除 > 和 **，转为 `xxx`
+    - 命令行（**cmd** 开头）→ 单行反引号包裹
+    - 纯文本描述 → 保留原样
+    """
+    out: List[str] = []
+    i = 0
+    n = len(synopsis_lines)
+    while i < n:
+        line = synopsis_lines[i]
+        stripped = line.strip()
+
+        # 空行
+        if not stripped:
+            i += 1
+            continue
+
+        # tab 缩进的 .Bd -literal 块
+        if line.startswith('\t') or line.startswith('        '):
+            code_lines: List[str] = []
+            while i < n:
+                ln = synopsis_lines[i]
+                if ln.startswith('\t') or ln.startswith('        '):
+                    # 去除前导 tab/空格
+                    content = ln.lstrip(' \t')
+                    content = clean_mandoc_escapes(content)
+                    code_lines.append(content)
+                    i += 1
+                elif ln.strip() == '':
+                    # 空行可能是块内或块结束，看下一行
+                    if i + 1 < n and (synopsis_lines[i + 1].startswith('\t') or
+                                      synopsis_lines[i + 1].startswith('        ')):
+                        code_lines.append('')
+                        i += 1
+                    else:
+                        break
+                else:
+                    break
+            if code_lines:
+                out.append('```sh')
+                out.extend(code_lines)
+                out.append('```')
+                out.append('')
+            continue
+
+        # > 前缀的 .Cd 块（.Bd -ragged）
+        if stripped.startswith('>'):
+            cd_lines: List[str] = []
+            while i < n:
+                ln = synopsis_lines[i]
+                s = ln.strip()
+                if s.startswith('>'):
+                    # 去除 > 前缀
+                    content = re.sub(r'^>\s?', '', s)
+                    # 去除 ** 加粗标记
+                    content = re.sub(r'\*\*([^*]+)\*\*', r'`\1`', content)
+                    content = clean_mandoc_escapes(content)
+                    if content:
+                        cd_lines.append(content)
+                    i += 1
+                elif s == '':
+                    # 空行可能是块结束
+                    break
+                else:
+                    break
+            if cd_lines:
+                for cl in cd_lines:
+                    out.append(cl)
+                out.append('')
+            continue
+
+        # 命令行（**cmd** 开头）
+        if is_synopsis_command_start(stripped, cmd_lower):
+            cmd_parts: List[str] = [stripped]
+            i += 1
+            # 合并后续非空非特殊行
+            while i < n:
+                nl = synopsis_lines[i].strip()
+                if not nl:
+                    break
+                if nl.startswith('>'):
+                    break
+                if synopsis_lines[i].startswith('\t') or synopsis_lines[i].startswith('        '):
+                    break
+                if is_synopsis_command_start(nl, cmd_lower):
+                    break
+                cmd_parts.append(nl)
+                i += 1
+            merged = ' '.join(cmd_parts)
+            cleaned = strip_inline_markup(merged)
+            cleaned = clean_mandoc_escapes(cleaned)
+            cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+            if cleaned:
+                out.append(f'`{cleaned}`')
+                out.append('')
+            continue
+
+        # 纯文本描述行：保留原样（合并连续文本行）
+        text_parts: List[str] = [stripped]
+        i += 1
+        while i < n:
+            nl = synopsis_lines[i].strip()
+            if not nl:
+                break
+            if nl.startswith('>'):
+                break
+            if synopsis_lines[i].startswith('\t') or synopsis_lines[i].startswith('        '):
+                break
+            if is_synopsis_command_start(nl, cmd_lower):
+                break
+            text_parts.append(nl)
+            i += 1
+        merged_text = ' '.join(text_parts)
+        merged_text = clean_mandoc_escapes(merged_text)
+        merged_text = re.sub(r'\s+', ' ', merged_text).strip()
+        if merged_text:
+            out.append(merged_text)
+            out.append('')
+
+    return out
+
+
 def post_process(md: str, display_name: str, section: int,
                  xref: CrossRefDB) -> str:
     """后处理 mandoc markdown 输出，使格式接近传统 man 渲染效果。
@@ -558,10 +708,12 @@ def post_process(md: str, display_name: str, section: int,
     3. 清理转义字符（\\[, \\], &nbsp;, \\_, \\*）
     4. SYNOPSIS 章节合并为代码块（反引号包裹的命令行）
     5. 去除 > 引用块前缀（mandoc 用 > 包裹 .It 列表项内容）
-    6. 合并被拆分的段落（mandoc 把每个内联宏单独成行）
-    7. 路径斜体改为加粗（*/path* → **/path**）
-    8. 交叉引用 name(N) 链接化
-    9. 去除页脚行
+    6. .Bd -literal 块（tab 缩进）转为 ```sh 代码围栏
+    7. 合并被拆分的段落（mandoc 把每个内联宏单独成行）
+    8. 路径斜体改为加粗（*/path* → **/path**）
+    9. 交叉引用 name(N) 链接化
+    10. 去除页脚行和残留页眉行
+    11. 章节标题去除反引号包裹
     """
     lines = md.splitlines()
     out: List[str] = []
@@ -596,9 +748,20 @@ def post_process(md: str, display_name: str, section: int,
                 skipped_title = True
                 # 不 continue，继续处理这行
 
+        # 残留页眉行：H1 后紧跟的 "XXX(N) - FreeBSD XXX Manual" 行
+        if not in_code_block and skipped_title:
+            if re.match(r'^[A-Z][A-Z0-9._-]*\(\d+\)\s*-\s*FreeBSD\s+\w+', line):
+                i += 1
+                continue
+
         # 页脚行：mandoc 输出 "W  - January 24, 2025 - MAN(1)" 或类似
         if not in_code_block and not skipped_footer:
             if re.match(r'^[A-Z]\s+-\s+\w+\s+\d+,?\s+\d+\s+-\s+[A-Z]', line):
+                skipped_footer = True
+                i += 1
+                continue
+            # .TH 格式页脚："\- - UNTITLED"
+            if re.match(r'^\\?-\s+-\s+\w+', line):
                 skipped_footer = True
                 i += 1
                 continue
@@ -619,8 +782,18 @@ def post_process(md: str, display_name: str, section: int,
             # 其他标题：记录当前章节
             m = re.match(r'^#+\s+(.+)$', line)
             if m:
-                current_section_header = m.group(1).upper()
-            line = "#" + line
+                title = m.group(1)
+                # 去除标题中的反引号包裹（mandoc 有时输出 # `BLUETOOTH_PROTO_HCI protocol`）
+                title = re.sub(r'^`([^`]+)`$', r'\1', title)
+                # 去除标题中的 ** 加粗标记
+                title = re.sub(r'\*\*([^*]+)\*\*', r'\1', title)
+                current_section_header = title.upper()
+                line = "#" + line.split('#', 1)[0] + " " + title if title else "#" + line
+                # 重建降级标题
+                orig_hash_count = len(line) - len(line.lstrip('#'))
+                line = "#" * (orig_hash_count + 1) + " " + title
+            else:
+                line = "#" + line
 
         # 非代码块内：清理转义和格式
         if not in_code_block:
@@ -630,6 +803,8 @@ def post_process(md: str, display_name: str, section: int,
             # 可能有多层嵌套引用（> > text），循环去除所有 > 前缀
             while re.match(r'^>\s?', line):
                 line = re.sub(r'^>\s?', '', line)
+            # .Cd 宏输出 **device xxx** → `device xxx`（内核配置声明用反引号）
+            line = re.sub(r'\*\*(device\s+\S+)\*\*', r'`\1`', line)
             # 路径斜体改加粗：*/path* → **/path**
             # 匹配 *...* 其中包含 / 的（路径）
             line = re.sub(r'\*([^\*]*/[^\*]*)\*', r'**\1**', line)
@@ -640,15 +815,75 @@ def post_process(md: str, display_name: str, section: int,
         i += 1
 
     result = "\n".join(out)
+    # 将 .Bd -literal 的 tab 缩进块转为 ```sh 代码围栏
+    result = convert_literal_blocks(result)
     # 合并有序列表的断行续行：如 "1.\tFreeBSD\n\tGeneral Commands Manual"
     result = merge_list_continuations(result)
     # 合并被拆分的段落（mandoc 把每个内联宏单独成行）
     result = merge_broken_paragraphs(result)
     # 将连续的 **标签**\n\n描述 模式转换为无序列表（嵌套子选项）
     result = convert_tag_desc_to_list(result)
+    # 修复 .Ns 宏产生的损坏输出：*** → ** ** 之间的分隔
+    result = fix_ns_macro_damage(result)
     # 清理多余空行
     result = re.sub(r'\n{3,}', '\n\n', result)
     return result.strip() + "\n"
+
+
+def convert_literal_blocks(text: str) -> str:
+    """将 .Bd -literal 的 tab/8空格缩进块转为 ```sh 代码围栏。
+
+    mandoc 把 .Bd -literal 块输出为 tab 缩进的纯文本行。
+    本函数检测连续的 tab/8空格缩进行，包裹在 ```sh ... ``` 中。
+    """
+    lines = text.split('\n')
+    out: List[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        # 检测 tab 或 8+ 空格缩进的行（非代码围栏内）
+        if (line.startswith('\t') or re.match(r'^ {8,}', line)) and line.strip():
+            block: List[str] = []
+            while i < n:
+                ln = lines[i]
+                if ln.startswith('\t') or re.match(r'^ {8,}', ln):
+                    content = ln.lstrip(' \t')
+                    block.append(content)
+                    i += 1
+                elif ln.strip() == '':
+                    # 空行：看下一行是否仍是缩进行
+                    if i + 1 < n and (lines[i + 1].startswith('\t') or
+                                      re.match(r'^ {8,}', lines[i + 1])):
+                        block.append('')
+                        i += 1
+                    else:
+                        break
+                else:
+                    break
+            if block:
+                out.append('```sh')
+                out.extend(block)
+                out.append('```')
+                out.append('')
+            continue
+        out.append(line)
+        i += 1
+    return '\n'.join(out)
+
+
+def fix_ns_macro_damage(text: str) -> str:
+    """修复 .Ns 宏产生的损坏输出。
+
+    mandoc 在处理 .Ns（无空格连接）时会产生 *** 系列损坏：
+    - *rhost*****:*path* → *rhost*:**:** *path*（应为 rhost:path 或 **rhost**:**:** **path**）
+    - **+ - ** / % ^*** → 损坏的运算符列表
+    """
+    # 修复 ***** 模式（多个连续星号）
+    text = re.sub(r'\*{4,}', '**', text)
+    # 修复 ** ** 之间的空连接：**word** **:** → **word****:**
+    # 这种损坏较难完美修复，仅做最小修复
+    return text
 
 
 def merge_list_continuations(text: str) -> str:
