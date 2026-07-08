@@ -1890,9 +1890,6 @@ def _th_format_synopsis(lines: List[str], display_name: str, section: int,
     has_ss = any(l.strip().startswith('.SS') for l in lines)
     is_complex = has_nf or has_hp or has_ss
 
-    # DEBUG
-    print(f"  [DEBUG _th_format_synopsis] has_nf={has_nf} has_hp={has_hp} has_ss={has_ss} is_complex={is_complex} lines={len(lines)}", file=sys.stderr)
-
     if not is_complex:
         # 简单命令行 SYNOPSIS：合并为单行反引号
         parts: List[str] = []
@@ -2031,14 +2028,11 @@ def _th_format_synopsis(lines: List[str], display_name: str, section: int,
             in_sig_block = True
             if macro in ('B', 'SB', 'I', 'SM'):
                 content = th_clean_escapes(rest)
-                content = th_process_font_markup(content)
-                content = _strip_markers(content)
             else:
                 _, args = th_split_macro_args(stripped)
                 if args:
-                    formatted = th_format_alternating(macro, args)
-                    formatted = _strip_markers(formatted)
-                    content = formatted
+                    # 代码块中不需要字体标记，直接清理转义连接
+                    content = ''.join(th_clean_escapes(a) for a in args)
                 else:
                     content = ''
             if content:
@@ -2047,8 +2041,6 @@ def _th_format_synopsis(lines: List[str], display_name: str, section: int,
 
         # 普通文本行（如 const char *malloc_conf;）
         content = th_clean_escapes(stripped)
-        content = th_process_font_markup(content)
-        content = _strip_markers(content)
         if content:
             in_sig_block = True
             sig_lines.append(content)
