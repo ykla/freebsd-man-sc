@@ -1337,10 +1337,10 @@ def th_clean_escapes(text: str) -> str:
     text = text.replace(r'\(ga', '`')
     # \*(Aq → '
     text = text.replace(r'\*(Aq', "'")
-    # \*(C` → `（Pod::Man 左引号，类似反引号）
-    text = text.replace(r'\*(C`', '`')
-    # \*(C' → '（Pod::Man 右引号）
-    text = text.replace(r"\*(C'", "'")
+    # \*(C` → ''（Pod::Man 左引号，\f(CW 已提供反引号，此处冗余）
+    text = text.replace(r'\*(C`', '')
+    # \*(C' → ''（Pod::Man 右引号，\f(CW 已提供反引号，此处冗余）
+    text = text.replace(r"\*(C'", '')
     # \*(XX — 其他通用字符串引用（跳过）
     text = re.sub(r'\\\*\([A-Z][A-Za-z]', '', text)
     # \m[blue] \m[] — 颜色标记（跳过）
@@ -1652,8 +1652,8 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
             continue
 
         # 跳过的 roff 控制宏
-        if re.match(r'^\.(nr|ds|ie|el|nh|ad|ft|in|ti|ta|ll|po|pl|ne|hy|IX|rs|re|HP|cw|ps|cs|rr|tm)\b', stripped) or \
-           re.match(r'^\.(nr|ds|ie|el|nh|ad|ft|in|ti|ta|ll|po|pl|ne|hy|IX|rs|re|HP|cw|ps|cs|rr|tm)$', stripped):
+        if re.match(r'^\.(nr|ds|ie|el|if|nh|ad|ft|in|ti|ta|ll|po|pl|ne|hy|IX|rs|re|HP|cw|ps|cs|rr|tm)\b', stripped) or \
+           re.match(r'^\.(nr|ds|ie|el|if|nh|ad|ft|in|ti|ta|ll|po|pl|ne|hy|IX|rs|re|HP|cw|ps|cs|rr|tm)$', stripped):
             continue
         if stripped == '.DT':
             continue
