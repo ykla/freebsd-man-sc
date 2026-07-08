@@ -2114,6 +2114,260 @@ def _th_format_synopsis(lines: List[str], display_name: str, section: int,
 
 
 # ============================================================
+# tbl 表格预处理器（.TS/.TE → markdown 表格）
+# ============================================================
+
+def _parse_tbl_column_spec(spec: str) -> str:
+    """解析单个 tbl 列说明符，返回 markdown 对齐方式。
+
+    l/la/n → :--- (左对齐)
+    r     → ---: (右对齐)
+    c     → :---: (居中)
+    s     → :--- (span，等同左对齐)
+    ^     → :--- (垂直展开，等同左对齐)
+    b/B   → :--- (加粗，仅用于数据格式，不影响对齐)
+    """
+    # 提取基础对齐字符（忽略修饰符 b, B, w(), z, |, ||）
+    spec = spec.strip()
+    # 移除列修饰符
+    spec = re.sub(r'[bB]', '', spec)  # 加粗
+    spec = re.sub(r'w\(\d+[a-zA-Z]*\)', '', spec)  # 宽度
+    spec = re.sub(r'[z|]', '', spec)  # 零宽、竖线
+    base = spec.strip()
+    if not base:
+        return ':---'
+    if base.startswith('r'):
+        return '---:'
+    if base.startswith('c'):
+        return ':---:'
+    # l, a, n, s, ^ 等
+    return ':---'
+
+
+def _preprocess_tbl_tables(text: str) -> Tuple[str, Dict[str, str]]:
+    """预处理 mdoc 源文件中的 tbl 表格，转换为 markdown 表格。
+
+    将 .TS/.TE 表格块替换为占位符标记，避免 mandoc markdown 后端崩溃。
+    返回 (修改后的文本, {占位符: markdown表格})。
+
+    支持的 tbl 特性：
+    - 基本对齐：l, r, c, n, a
+    - 修饰符：b, B（加粗）, w(N)（宽度）, z（零宽）
+    - 选项：box, center, expand, allbox, tab()
+    - 数据：T{...T} 多行文本块, _ 水平线, = 双水平线
+    - 表格续行：.T&
+    - 单元格内 roff 转义：\\fB, \\fI, \\&
+    """
+    lines = text.split('\n')
+    result_lines: List[str] = []
+    tables: Dict[str, str] = {}
+    table_idx = 0
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        if stripped == '.TS' or stripped.startswith('.TS '):
+            # 开始收集表格
+            tbl_lines: List[str] = []
+            i += 1
+            while i < len(lines):
+                l = lines[i]
+                if l.strip() == '.TE' or l.strip().startswith('.TE '):
+                    i += 1
+                    break
+                tbl_lines.append(l)
+                i += 1
+
+            # 转换表格
+            md_table = _tbl_to_markdown(tbl_lines)
+            placeholder = f'__TBL_{table_idx}__'
+            tables[placeholder] = md_table
+            result_lines.append(placeholder)
+            table_idx += 1
+        else:
+            result_lines.append(line)
+            i += 1
+
+    return '\n'.join(result_lines), tables
+
+
+def _tbl_to_markdown(tbl_lines: List[str]) -> str:
+    """将 tbl 表格行列表转换为 markdown 表格。"""
+    # 解析选项和格式说明
+    options: List[str] = []
+    format_lines: List[str] = []
+    data_lines: List[str] = []
+    state = 'options'
+
+    for line in tbl_lines:
+        stripped = line.rstrip('\n')
+        if state == 'options':
+            if stripped.endswith(';'):
+                options.append(stripped)
+            else:
+                state = 'format'
+                format_lines.append(stripped)
+        elif state == 'format':
+            if stripped.strip().endswith('.'):
+                # 格式结束
+                format_lines.append(stripped)
+                state = 'data'
+            else:
+                format_lines.append(stripped)
+        elif state == 'data':
+            data_lines.append(stripped)
+
+    # 解析选项
+    option_str = ' '.join(options)
+    # 解析 tab() 分隔符
+    tab_sep = '\t'
+    tab_match = re.search(r'tab\(([^)]*)\)', option_str)
+    if tab_match:
+        tab_sep = tab_match.group(1)
+
+    # 解析格式说明
+    format_str = ' '.join(format_lines)
+    # 去除末尾的 .
+    if format_str.endswith('.'):
+        format_str = format_str[:-1]
+
+    # 分割列说明
+    col_specs = format_str.split()
+    # 计算实际列数（排除纯修饰符列如 |, ||, _, =）
+    alignments: List[str] = []
+    for cs in col_specs:
+        if cs in ('|', '||', '_', '='):
+            continue
+        # 处理 s（span）和 ^（垂直展开）——不增加列数但需要对齐
+        if cs.startswith('s') or cs.startswith('^'):
+            continue
+        alignments.append(_parse_tbl_column_spec(cs))
+
+    if not alignments:
+        return ''
+
+    # 处理数据行
+    rows: List[List[str]] = []
+    raw_rows: List[str] = []
+    in_text_block = False
+    text_block_content: List[str] = []
+
+    for line in data_lines:
+        if in_text_block:
+            if line.strip() == 'T}':
+                in_text_block = False
+                # 合并 text block 内容
+                rows.append(['\n'.join(text_block_content)])
+                text_block_content = []
+            else:
+                text_block_content.append(line)
+            continue
+
+        if line.strip() == 'T{':
+            in_text_block = True
+            text_block_content = []
+            continue
+
+        if line.strip() in ('_', '='):
+            # 水平线——跳过（markdown 表格不支持）
+            # 但如果前一行是数据，标记为表头分隔
+            if rows:
+                raw_rows.append('__SEP__')
+            continue
+
+        if line.strip() == '.T&':
+            # 表格续行——跳过格式重新解析
+            continue
+
+        # 分割单元格
+        cells = line.split(tab_sep)
+        rows.append(cells)
+
+    if not rows:
+        return ''
+
+    # 判断第一行是否为表头（如果第一行之后有 __SEP__）
+    has_header = len(raw_rows) > 0 and raw_rows[0] == '__SEP__' if raw_rows else False
+
+    # 构建 markdown 表格
+    md_lines: List[str] = []
+
+    # 确定表头行和数据行
+    if has_header and len(rows) >= 2:
+        header_row = rows[0]
+        data_rows = rows[1:]
+    else:
+        header_row = None
+        data_rows = rows
+
+    # 清理单元格内容
+    def clean_cell(cell: str) -> str:
+        """清理单元格内的 roff 转义。"""
+        # 移除 \fB, \fI, \fR, \fP
+        cell = re.sub(r'\\f[BIRP]', '', cell)
+        # 移除 \f(XX
+        cell = re.sub(r'\\f\([A-Z]{2}', '', cell)
+        # 移除 \&
+        cell = cell.replace('\\&', '')
+        # 移除 \*(XX
+        cell = re.sub(r'\\\*\([A-Z][A-Za-z]', '', cell)
+        # 移除 \s+/-N
+        cell = re.sub(r'\\s[+-]?\d', '', cell)
+        # 移除 \sN
+        cell = re.sub(r'\\s\d+', '', cell)
+        # 移除 \h'...'
+        cell = re.sub(r"\\h'[^']*'", '', cell)
+        # 移除 \w'...'
+        cell = re.sub(r"\\w'[^']*'", '', cell)
+        # 移除 \|  细空格
+        cell = cell.replace('\\|', '')
+        # 移除 \^  1/6 em 空格
+        cell = cell.replace('\\^', '')
+        # 移除 \%  可选连字符
+        cell = cell.replace('\\%', '')
+        # 移除 \-  连字符
+        cell = cell.replace('\\-', '-')
+        # 移除 \(xx 特殊字符
+        cell = re.sub(r'\\\([a-z]{2}', '', cell)
+        # 移除 \e  转义反斜杠
+        cell = cell.replace('\\e', '\\')
+        # 移除 \~  不间断空格
+        cell = cell.replace('\\~', ' ')
+        # 移除 \0  数字宽度空格
+        cell = cell.replace('\\0', ' ')
+        # 清理多余空格
+        cell = cell.strip()
+        return cell
+
+    # 构建表头
+    if header_row:
+        header_cells = [clean_cell(c) for c in header_row]
+        # 确保列数匹配
+        while len(header_cells) < len(alignments):
+            header_cells.append('')
+        header_cells = header_cells[:len(alignments)]
+        md_lines.append('| ' + ' | '.join(header_cells) + ' |')
+    else:
+        # 无表头，生成空表头
+        md_lines.append('| ' + ' | '.join([''] * len(alignments)) + ' |')
+
+    # 分隔行
+    md_lines.append('|' + '|'.join(alignments) + '|')
+
+    # 数据行
+    for row in data_rows:
+        cells = [clean_cell(c) for c in row]
+        while len(cells) < len(alignments):
+            cells.append('')
+        cells = cells[:len(alignments)]
+        md_lines.append('| ' + ' | '.join(cells) + ' |')
+
+    return '\n'.join(md_lines)
+
+
+# ============================================================
 # 转换：单文件
 # ============================================================
 
@@ -2156,10 +2410,23 @@ def convert_one(src_path: Path, out_dir: Path, xref: CrossRefDB,
         out_path.write_text(processed, encoding="utf-8")
     else:
         # mdoc 格式：mandoc + 后处理
-        tmp_path = out_dir / f".{out_name}.tmp"
-        run_mandoc(src_path, tmp_path)
+        # 先预处理 tbl 表格（.TS/.TE → markdown 占位符）
+        processed_text, tbl_tables = _preprocess_tbl_tables(text)
+        if tbl_tables:
+            # 有 tbl 表格，写预处理后的临时源文件
+            tmp_src = out_dir / f".{out_name}.src.tmp"
+            tmp_src.write_text(processed_text, encoding="utf-8")
+            tmp_path = out_dir / f".{out_name}.tmp"
+            run_mandoc(tmp_src, tmp_path)
+            tmp_src.unlink(missing_ok=True)
+        else:
+            tmp_path = out_dir / f".{out_name}.tmp"
+            run_mandoc(src_path, tmp_path)
         md = tmp_path.read_text(encoding="utf-8", errors="replace")
         processed = post_process(md, display_name, section, xref)
+        # 替换 tbl 占位符
+        for placeholder, md_table in tbl_tables.items():
+            processed = processed.replace(placeholder, md_table)
         out_path.write_text(processed, encoding="utf-8")
         tmp_path.unlink(missing_ok=True)
 
