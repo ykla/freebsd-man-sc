@@ -375,8 +375,17 @@ def clean_mandoc_escapes(text: str) -> str:
     text = text.replace(r'\[', '[').replace(r'\]', ']')
     # &nbsp; → 空格
     text = text.replace('&nbsp;', ' ')
-    # &#160; → 空格（不间断空格的数字实体）
-    text = text.replace('&#160;', ' ')
+    # HTML 数字实体清理
+    text = text.replace('&#160;', ' ')   # 不间断空格
+    text = text.replace('&#45;', '-')    # 连字符
+    text = text.replace('&#92;', '\\')   # 反斜杠
+    text = text.replace('&#8220;', '"')  # 左双引号
+    text = text.replace('&#8221;', '"')  # 右双引号
+    text = text.replace('&#8216;', "'")  # 左单引号
+    text = text.replace('&#8217;', "'")  # 右单引号
+    text = text.replace('&#8203;', '')   # 零宽空格
+    text = text.replace('&#8204;', '')   # 零宽不连字 (zwnj)
+    text = text.replace('&zwnj;', '')    # 零宽不连字命名实体
     # &gt; → >, &lt; → <, &amp; → &, &quot; → "
     text = text.replace('&gt;', '>').replace('&lt;', '<')
     text = text.replace('&amp;', '&').replace('&quot;', '"')
@@ -386,8 +395,16 @@ def clean_mandoc_escapes(text: str) -> str:
     text = text.replace(r'\*', '*')
     # \` → ` （转义反引号还原）
     text = text.replace(r'\`', '`')
+    # 转义点号还原：4\.4BSD → 4.4BSD
+    text = text.replace(r'\.', '.')
     # '`code`' → `code` （去除包裹反引号代码的单引号）
     text = re.sub(r"'`([^`]+)`'", r'`\1`', text)
+    # 反引号代码内的斜体标记去除：`sysctl *hw.machine_arch*` → `sysctl hw.machine_arch`
+    def deitalicize_code(m: re.Match) -> str:
+        inner = m.group(1)
+        inner = re.sub(r'\*([^*]+)\*', r'\1', inner)
+        return f'`{inner}`'
+    text = re.sub(r'`([^`]+)`', deitalicize_code, text)
     # \\ → \ （转义反斜杠还原，但保留代码块内的）
     # 注意：不要在代码块内做这个替换
     return text
@@ -440,43 +457,93 @@ def process_synopsis(lines: List[str], start_idx: int, display_name: str,
         synopsis_lines.append(line)
         i += 1
 
-    # 解析命令行：每个 **man** 开头为新命令行
-    commands: List[List[str]] = []  # 每个元素是一个命令的所有行
-    current_cmd: List[str] = []
+    # 判断 SYNOPSIS 类型：
+    # - C 函数声明型（man2/man3/man9）：含 #include 或函数声明（int/void/char * 等）
+    # - 命令行型（man1/man5/man8）：以 **cmd** 开头
+    # mandoc 输出 C 代码时用加粗/斜体标记：**#include ...**, *int*, **func**()
+    is_c_synopsis = False
     for ln in synopsis_lines:
-        stripped = ln.strip()
-        if not stripped:
-            # 空行：如果当前有命令，结束当前命令
-            if current_cmd:
-                commands.append(current_cmd)
-                current_cmd = []
-            continue
-        if is_synopsis_command_start(stripped, cmd_lower):
-            # 新命令开始
-            if current_cmd:
-                commands.append(current_cmd)
-            current_cmd = [stripped]
-        else:
-            if current_cmd:
-                current_cmd.append(stripped)
-            else:
-                # SYNOPSIS 中命令名前的行（罕见），单独作为命令
-                current_cmd = [stripped]
-    if current_cmd:
-        commands.append(current_cmd)
+        s = ln.strip()
+        # 去除 markdown 标记后检测
+        plain = strip_inline_markup(s)
+        plain = clean_mandoc_escapes(plain)
+        plain = plain.replace('`', '').strip()
+        if plain.startswith('#include'):
+            is_c_synopsis = True
+            break
+        # 检测 C 函数声明特征：类型 + 函数名/指针
+        if re.match(r'^(int|void|char\s*\*?|size_t|ssize_t|long|unsigned|struct|enum|const|uint\w+|int\w+|u_\w+|u_int\w*|__\w+)\s', plain):
+            is_c_synopsis = True
+            break
+        # 检测 #define / #ifdef 等预处理指令
+        if plain.startswith('#') and not plain.startswith('#!'):
+            is_c_synopsis = True
+            break
 
-    # 每个命令合并为一行，用反引号包裹
-    for cmd_lines in commands:
-        merged = ' '.join(cmd_lines)
-        # 清理 markdown 标记
-        cleaned = strip_inline_markup(merged)
-        # 清理转义
-        cleaned = clean_mandoc_escapes(cleaned)
-        # 清理多余空格
-        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-        if cleaned:
-            out.append(f'`{cleaned}`')
+    if is_c_synopsis:
+        # C 函数声明：用三反引号代码块，保持多行结构
+        code_lines: List[str] = []
+        for ln in synopsis_lines:
+            stripped = ln.strip()
+            if not stripped:
+                continue
+            # C 代码清理：先还原转义，再去除 markdown 标记
+            # mandoc 输出 **bold**, *italic*, \`code\`, \* (转义星号/C指针)
+            cleaned = stripped
+            # 还原转义星号为占位符（C 指针 *）
+            cleaned = cleaned.replace(r'\*', '\x00STAR\x00')
+            # 还原转义下划线
+            cleaned = cleaned.replace(r'\_', '_')
+            # 去除 **bold** → bold
+            cleaned = re.sub(r'\*\*([^*]+)\*\*', r'\1', cleaned)
+            # 去除 *italic* → italic
+            cleaned = re.sub(r'\*([^*]+)\*', r'\1', cleaned)
+            # 去除 `code` → code
+            cleaned = re.sub(r'`([^`]+)`', r'\1', cleaned)
+            # 还原 HTML 实体
+            cleaned = clean_mandoc_escapes(cleaned)
+            # 还原占位符为 *
+            cleaned = cleaned.replace('\x00STAR\x00', '*')
+            # 压缩行内多余空格
+            cleaned = re.sub(r' {2,}', ' ', cleaned).strip()
+            if cleaned:
+                code_lines.append(cleaned)
+        if code_lines:
+            out.append('```c')
+            out.extend(code_lines)
+            out.append('```')
             out.append('')
+    else:
+        # 命令行型：每个 **cmd** 开头为新命令行，合并为单行反引号
+        commands: List[List[str]] = []
+        current_cmd: List[str] = []
+        for ln in synopsis_lines:
+            stripped = ln.strip()
+            if not stripped:
+                if current_cmd:
+                    commands.append(current_cmd)
+                    current_cmd = []
+                continue
+            if is_synopsis_command_start(stripped, cmd_lower):
+                if current_cmd:
+                    commands.append(current_cmd)
+                current_cmd = [stripped]
+            else:
+                if current_cmd:
+                    current_cmd.append(stripped)
+                else:
+                    current_cmd = [stripped]
+        if current_cmd:
+            commands.append(current_cmd)
+
+        for cmd_lines in commands:
+            merged = ' '.join(cmd_lines)
+            cleaned = strip_inline_markup(merged)
+            cleaned = clean_mandoc_escapes(cleaned)
+            cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+            if cleaned:
+                out.append(f'`{cleaned}`')
+                out.append('')
 
     return out, i
 
@@ -655,12 +722,13 @@ def is_block_boundary(line: str, lines: Optional[List[str]] = None, idx: int = -
     if re.match(r'^(-{3,}|\*{3,})$', s):
         return True
     # 标签列表项：**-K** 或 **--opt** 这种以 ** 开头且紧跟非字母数字
+    # 也匹配 **word**() 这种函数名加粗（后跟括号）
     m = re.match(r'^\*\*([^*]+)\*\*(.*)$', s)
     if m:
         tag = m.group(1)
         rest = m.group(2).strip()
-        # rest 全是标点（如 , . ; :)→ 段落内联标记，不是边界
-        if rest and re.match(r'^[.,;:!?)]+$', rest):
+        # rest 全是标点（如 , . ; : () ()）→ 段落内联标记，不是边界
+        if rest and re.match(r'^[.,;:!?()]+$', rest):
             return False
         # 标签后跟参数（如 **file** *path*）→ 边界
         if rest:

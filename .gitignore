@@ -238,3 +238,4 @@ $RECYCLE.BIN/
 /en2
 *.zip
 libc.sh
+*.pyc
