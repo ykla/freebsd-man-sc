@@ -1496,6 +1496,7 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
 
     # .TP 标签处理
     pending_tp = False  # 下一行是 .TP 的标签
+    pending_ip_desc = False  # .IP 标签已输出，等待描述
 
     # 当前章节
     current_section = ""
@@ -1726,13 +1727,74 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
         out.extend(syn_out)
 
     result = '\n'.join(out)
+    # 合并被拆分的段落（连续非空非特殊行用空格连接）
+    result = _th_merge_paragraphs(result)
     # 清理多余空行
     result = re.sub(r'\n{3,}', '\n\n', result)
     # 清理 ** ** 之间的空连接
     result = re.sub(r'\*\*\s+\*\*', '', result)
     # 清理 * * 之间的空连接
     result = re.sub(r'\*\s+\*', '', result)
+    # 清理空标记 ** ** → 空
+    result = re.sub(r'\*\*\s*\*\*', '', result)
+    result = re.sub(r'\*\s*\*', '', result)
     return result.strip() + '\n'
+
+
+def _th_merge_paragraphs(text: str) -> str:
+    """合并 .TH 转换输出中被拆分的段落。
+
+    连续的普通文本行（非标题、非列表项、非代码块）合并为一个段落。
+    """
+    lines = text.split('\n')
+    out: List[str] = []
+    para: List[str] = []
+
+    def flush():
+        if para:
+            merged = ' '.join(p.strip() for p in para if p.strip())
+            merged = re.sub(r' {2,}', ' ', merged)
+            if merged:
+                out.append(merged)
+            para.clear()
+
+    in_code = False
+    for line in lines:
+        s = line.strip()
+        if s.startswith('```'):
+            flush()
+            in_code = not in_code
+            out.append(line)
+            continue
+        if in_code:
+            out.append(line)
+            continue
+        if not s:
+            flush()
+            out.append('')
+            continue
+        # 边界行：不合并
+        if s.startswith('#'):  # 标题
+            flush()
+            out.append(line)
+            continue
+        if s.startswith('- ') or s.startswith('* '):  # 列表项
+            flush()
+            out.append(line)
+            continue
+        if s.startswith('```'):  # 代码块
+            flush()
+            out.append(line)
+            continue
+        if s.startswith('|'):  # 表格
+            flush()
+            out.append(line)
+            continue
+        # 普通文本行：加入段落
+        para.append(line)
+
+    flush()
+    return '\n'.join(out)
 
 
 def _th_format_synopsis(lines: List[str], display_name: str, section: int,
