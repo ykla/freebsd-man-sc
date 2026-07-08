@@ -735,8 +735,9 @@ def post_process(md: str, display_name: str, section: int,
             continue
 
         # 首行标题：mandoc 输出 "MAN(1) - FreeBSD General Commands Manual"
+        # 注意：mandoc 可能输出转义下划线如 "NG\_BTSOCKET(4)"
         if not skipped_title and not in_code_block:
-            if re.match(r'^[A-Z][A-Z0-9._-]*\(\d+\)\s*-\s*FreeBSD', line):
+            if re.match(r'^[A-Z][A-Z0-9._\\-]*\(\d+\)\s*-\s*FreeBSD', line):
                 out.append(f"# {display_name.lower()}({section})")
                 out.append("")
                 skipped_title = True
@@ -750,7 +751,7 @@ def post_process(md: str, display_name: str, section: int,
 
         # 残留页眉行：H1 后紧跟的 "XXX(N) - FreeBSD XXX Manual" 行
         if not in_code_block and skipped_title:
-            if re.match(r'^[A-Z][A-Z0-9._-]*\(\d+\)\s*-\s*FreeBSD\s+\w+', line):
+            if re.match(r'^[A-Z][A-Z0-9._\\-]*\(\d+\)\s*-\s*FreeBSD\s+\w+', line):
                 i += 1
                 continue
 
