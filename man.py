@@ -1872,6 +1872,13 @@ def _th_format_synopsis(lines: List[str], display_name: str, section: int,
     1. 简单命令行（如 ipf.8）：.B cmd [.B -opt] [<arg>] → 合并为单行反引号
     2. 复杂函数签名（如 jemalloc.3）：含 .nf/.fi 代码块、.SS 子章节、.HP+.BI 函数签名
     """
+
+    def _strip_markers(text: str) -> str:
+        """移除 bold/italic 标记，保留纯文本。"""
+        text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+        text = re.sub(r'\*([^*]+)\*', r'\1', text)
+        text = re.sub(r'_([^_]+)_', r'\1', text)
+        return text
     out: List[str] = []
     # 先检测是否为复杂 SYNOPSIS（含 .nf/.fi 或 .HP 或 .SS）
     has_nf = any(l.strip().startswith('.nf') for l in lines)
