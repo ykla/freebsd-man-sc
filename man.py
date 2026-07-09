@@ -837,6 +837,25 @@ def post_process(md: str, display_name: str, section: int,
     result = re.sub(r'\n\*\*\*\n', '\n\\\\*\n', result)
     # 包裹裸 URL（满足 MD034）
     result = re.sub(r'(?<![<(\[])(https?://[^\s<>()\]]+)', r'<\1>', result)
+    # 转义行首的 # 防止被识别为 H1（如 .Dl 输出的配置文件注释 # default instance）
+    # 只转义 # 后跟小写字母/数字且不含括号的行（排除 # name(N) 格式的合法标题）
+    def _escape_config_hash(m: re.Match) -> str:
+        line = m.group(0)
+        # 如果行包含括号 (，可能是 # name(N) 标题，不转义
+        if '(' in line:
+            return line
+        # 否则转义
+        return '\\' + line
+    result = re.sub(r'^# [a-z0-9][^\n]*$', _escape_config_hash, result, flags=re.MULTILINE)
+    # 在标题中用反引号包裹 <...> 防止被识别为 HTML 标签而忽略（导致 MD024 重复标题）
+    # 如 mac_do.4 的 "Rule's <from> Part" 和 "Rule's <to> Part"
+    def _quote_angle_in_heading(m: re.Match) -> str:
+        hashes = m.group(1)
+        title = m.group(2)
+        title = re.sub(r'(&lt;[^&]*?&gt;)', r'`\1`', title)
+        title = re.sub(r'(<[^<>]*>)', r'`\1`', title)
+        return f"{hashes} {title}"
+    result = re.sub(r'^(#{1,6}) (.+)$', _quote_angle_in_heading, result, flags=re.MULTILINE)
     # 清理尾部空格（满足 MD009）
     result = re.sub(r'[ \t]+\n', '\n', result)
     # 确保标题、列表、代码围栏前后有空行（满足 MD022/MD031/MD032）
@@ -847,10 +866,10 @@ def post_process(md: str, display_name: str, section: int,
 
 
 def convert_literal_blocks(text: str) -> str:
-    """将 .Bd -literal 的 tab/8空格缩进块转为 ```sh 代码围栏。
+    """将 .Bd -literal 的 tab/4空格缩进块转为 ```sh 代码围栏。
 
     mandoc 把 .Bd -literal 块输出为 tab 缩进的纯文本行。
-    本函数检测连续的 tab/8空格缩进行，包裹在 ```sh ... ``` 中。
+    本函数检测连续的 tab/4+空格缩进行，包裹在 ```sh ... ``` 中。
     """
     lines = text.split('\n')
     out: List[str] = []
@@ -858,12 +877,12 @@ def convert_literal_blocks(text: str) -> str:
     n = len(lines)
     while i < n:
         line = lines[i]
-        # 检测 tab 或 8+ 空格缩进的行（非代码围栏内）
-        if (line.startswith('\t') or re.match(r'^ {8,}', line)) and line.strip():
+        # 检测 tab 或 4+ 空格缩进的行（非代码围栏内）
+        if (line.startswith('\t') or re.match(r'^ {4,}', line)) and line.strip():
             block: List[str] = []
             while i < n:
                 ln = lines[i]
-                if ln.startswith('\t') or re.match(r'^ {8,}', ln):
+                if ln.startswith('\t') or re.match(r'^ {4,}', ln):
                     content = ln.lstrip(' \t')
                     # 清理 HTML 实体和转义字符（代码块内的 C 代码注释等）
                     content = clean_mandoc_escapes(content)
@@ -872,7 +891,7 @@ def convert_literal_blocks(text: str) -> str:
                 elif ln.strip() == '':
                     # 空行：看下一行是否仍是缩进行
                     if i + 1 < n and (lines[i + 1].startswith('\t') or
-                                      re.match(r'^ {8,}', lines[i + 1])):
+                                      re.match(r'^ {4,}', lines[i + 1])):
                         block.append('')
                         i += 1
                     else:
@@ -1583,7 +1602,10 @@ def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) ->
                 # 字体真正改变时更新 prev_font
                 if font != 'P':
                     prev_font = current_font
-                # 关闭当前字体标记
+                # 关闭当前字体标记（先去掉文本末尾的空格，避免 **text ** 模式 MD037）
+                if current_font in ('B', 'I', 'CW'):
+                    while result and isinstance(result[-1], str) and result[-1] == ' ':
+                        result.pop()
                 if current_font == 'B':
                     result.append('**')
                 elif current_font == 'I':
@@ -1606,7 +1628,10 @@ def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) ->
                     i += 5
                     continue
                 prev_font = current_font
-                # 关闭当前字体标记
+                # 关闭当前字体标记（先去掉文本末尾的空格，避免 **text ** 模式 MD037）
+                if current_font in ('B', 'I', 'CW'):
+                    while result and isinstance(result[-1], str) and result[-1] == ' ':
+                        result.pop()
                 if current_font == 'B':
                     result.append('**')
                 elif current_font == 'I':
@@ -1631,6 +1656,10 @@ def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) ->
         state['prev'] = prev_font
     else:
         # 无状态模式（独立行处理）：关闭未闭合的标记
+        # 先去掉文本末尾的空格，避免 **text ** 模式 MD037
+        if current_font in ('B', 'I', 'CW'):
+            while result and isinstance(result[-1], str) and result[-1] == ' ':
+                result.pop()
         if current_font == 'B':
             result.append('**')
         elif current_font == 'I':
@@ -1775,9 +1804,11 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
     pending_tp = False  # 下一行是 .TP 的标签
     pending_ip_desc = False  # .IP 标签已输出，等待描述
     pending_font = None  # .B/.I 空参数时，下一行文本的字体宏
+    pending_ss = False  # .SS 空参数时，下一行文本是子章节标题
 
     # 当前章节
     current_section = ""
+    seen_sections: Set[str] = set()  # 已出现的章节标题（检测重复 .SH）
 
     # 段落缓冲区：收集普通文本行（仅 clean_escapes，未处理字体标记）
     # 遇到边界时 flush：合并为一行，统一处理字体标记
@@ -1944,12 +1975,19 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
                 synopsis_lines = []
                 out.append("## SYNOPSIS")
                 out.append("")
+                seen_sections.add(current_section)
+                continue
+
+            # 检测重复 .SH（如 ipnat.5 有两个 KERNEL PROXIES）
+            # 跳过重复的章节标题，避免 MD024
+            if current_section in seen_sections:
                 continue
 
             # 翻译章节标题
             cn_name = TH_SECTION_MAP.get(current_section, sec_name)
             out.append(f"## {cn_name}")
             out.append("")
+            seen_sections.add(current_section)
             continue
 
         # .SS — 子章节标题
@@ -1962,6 +2000,10 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
 
             flush_para()
             sub_name = stripped[3:].strip().strip('"').strip("'")
+            # .SS 空参数：下一行文本才是子章节标题（man 格式特性）
+            if not sub_name:
+                pending_ss = True
+                continue
             sub_name = th_clean_escapes(sub_name)
             sub_name = re.sub(r'\s+', ' ', sub_name).strip()
             out.append(f"### {sub_name}")
@@ -1990,6 +2032,8 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
             if args:
                 tag = th_clean_escapes(args[0])
                 tag = th_process_font_markup(tag)
+                # 去掉前导空格（如 " 1." → "1."），避免产生 "-  1."（MD030）
+                tag = tag.strip()
                 out.append(f"- {tag}")
                 pending_ip_desc = True
             continue
@@ -2037,6 +2081,16 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
         # 只做 clean_escapes，加入段落缓冲区，统一处理字体标记
         content = th_clean_escapes(line)
 
+        # .SS 空参数后的下一行文本：作为子章节标题
+        if pending_ss:
+            sub_name = th_clean_escapes(content.strip())
+            sub_name = re.sub(r'\s+', ' ', sub_name).strip()
+            if sub_name:
+                out.append(f"### {sub_name}")
+                out.append("")
+            pending_ss = False
+            continue
+
         # .B/.I 空参数后的下一行文本：应用字体宏
         if pending_font:
             content_processed = th_process_font_markup(content)
@@ -2081,8 +2135,17 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
     result = re.sub(r'(?<!\*)\*\s+\*(?!\*)', '', result)
     # 清理 **** 系列（重复 bold 开关）→ 空
     result = re.sub(r'\*{4,}', '', result)
+    # 修复 *** 模式（bold 关闭 + italic 开启/关闭产生 ***，避免 MD037）
+    # 简化为 **（bold 关闭），因为源文件的 *** 都是字体切换产生，非合法 bold+italic
+    result = re.sub(r'\*\*\*', '**', result)
     # 包裹裸 URL（满足 MD034），排除已在 <> 内或代码块内的
     result = re.sub(r'(?<![<(\[])(https?://[^\s<>()\]]+)', r'<\1>', result)
+    # 包裹裸邮箱地址（满足 MD034），排除已在 <> 内的
+    # 匹配 user@host.tld 模式（不含已有 < 前缀）
+    result = re.sub(r'(?<![<\w])([\w.+-]+@[\w.-]+\.\w{2,})', r'<\1>', result)
+    # 转义字面量 '_ 防止被识别为 underscore 风格 italic（避免 MD049）
+    # 如 flex.1 的 underscore ('_') 中的 '_
+    result = re.sub(r"'_", r"'\\_", result)
     # 清理尾部空格（满足 MD009）
     result = re.sub(r'[ \t]+\n', '\n', result)
     # 确保标题、列表、代码围栏前后有空行（满足 MD022/MD031/MD032）
