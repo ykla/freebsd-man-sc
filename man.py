@@ -1549,7 +1549,7 @@ def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) ->
     \\fP 返回上一字体
     \\f(CW 设置当前字体为等宽（Constant Width）
 
-    使用 ** 表示 bold，_ 表示 italic（避免 ** 与 * 混合产生 *** 歧义），
+    使用 ** 表示 bold，* 表示 italic（满足 MD049/MD050 asterisk 风格），
     ` 表示等宽字体。
 
     state: 可选的状态字典 {'current': 'R', 'prev': 'R'}，用于跨行状态传递。
@@ -1583,7 +1583,7 @@ def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) ->
                 if current_font == 'B':
                     result.append('**')
                 elif current_font == 'I':
-                    result.append('_')
+                    result.append('*')
                 elif current_font == 'CW':
                     result.append('`')
                 current_font = new_font
@@ -1591,7 +1591,7 @@ def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) ->
                 if current_font == 'B':
                     result.append('**')
                 elif current_font == 'I':
-                    result.append('_')
+                    result.append('*')
                 i += 3
                 continue
             # 双字符字体名：\\f(CW \\f(CR 等
@@ -1606,7 +1606,7 @@ def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) ->
                 if current_font == 'B':
                     result.append('**')
                 elif current_font == 'I':
-                    result.append('_')
+                    result.append('*')
                 elif current_font == 'CW':
                     result.append('`')
                 current_font = new_font
@@ -1616,7 +1616,7 @@ def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) ->
                 elif current_font == 'B':
                     result.append('**')
                 elif current_font == 'I':
-                    result.append('_')
+                    result.append('*')
                 i += 5
                 continue
         result.append(text[i])
@@ -1630,7 +1630,7 @@ def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) ->
         if current_font == 'B':
             result.append('**')
         elif current_font == 'I':
-            result.append('_')
+            result.append('*')
         elif current_font == 'CW':
             result.append('`')
     return ''.join(result)
@@ -1681,8 +1681,8 @@ def th_format_alternating(macro: str, args: List[str]) -> str:
     """处理交替字体宏 .BR .BI .IR .RB .RI .IB 等。
 
     .BR a b c → **a** b **c**（B/R 交替）
-    .BI a b → **a** _b_
-    .IR a b → _a_ b
+    .BI a b → **a** *b*
+    .IR a b → *a* b
     """
     if not macro or len(macro) < 2:
         return ' '.join(args)
@@ -1694,7 +1694,7 @@ def th_format_alternating(macro: str, args: List[str]) -> str:
         if font == 'B':
             result.append(f'**{cleaned}**')
         elif font == 'I':
-            result.append(f'_{cleaned}_')
+            result.append(f'*{cleaned}*')
         else:  # R
             result.append(cleaned)
     return ''.join(result)
@@ -2002,13 +2002,13 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
             flush_para()
             # 分割参数
             if macro in ('B', 'I', 'SB', 'SM'):
-                # .B text → **text** 或 _text_
+                # .B text → **text** 或 *text*（asterisk 风格，满足 MD049/MD050）
                 content = th_clean_escapes(rest)
                 content = th_process_font_markup(content)
                 if macro in ('B', 'SB'):
                     formatted = f'**{content}**' if not content.startswith('**') else content
                 else:  # I, SM
-                    formatted = f'_{content}_' if not content.startswith('_') else content
+                    formatted = f'*{content}*' if not content.startswith('*') else content
             else:
                 # .BR .BI .IR .RB .RI .IB — 交替字体
                 _, args = th_split_macro_args(stripped)
@@ -2052,8 +2052,9 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
     result = re.sub(r'\n{3,}', '\n\n', result)
     # 清理空 bold：** ** → 空（要求中间有空白，不匹配 **text**）
     result = re.sub(r'\*\*\s+\*\*', '', result)
-    # 清理空 italic：_ _ → 空（要求中间有空白，不匹配 _text_）
-    result = re.sub(r'(?<!_)_\s+_(?!_)', '', result)
+    # 清理空 italic：* * → 空（要求中间有空白，不匹配 *text*）
+    # 注意：不匹配 **（避免误清理 bold 标记）
+    result = re.sub(r'(?<!\*)\*\s+\*(?!\*)', '', result)
     # 清理 **** 系列（重复 bold 开关）→ 空
     result = re.sub(r'\*{4,}', '', result)
     # 确保标题、列表、代码围栏前后有空行（满足 MD022/MD031/MD032）
