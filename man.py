@@ -386,6 +386,12 @@ def clean_mandoc_escapes(text: str) -> str:
     text = text.replace('&#8221;', '"')  # 右双引号
     text = text.replace('&#8216;', "'")  # 左单引号
     text = text.replace('&#8217;', "'")  # 右单引号
+    # troff 引号语法：\`\`text'' → "text"（mandoc 输出的双引号引用）
+    # ``text'' 会被 markdownlint 误识别为代码围栏内空格（MD038）
+    # 转义的反引号 `` → `` 先去除转义
+    text = text.replace('\\`\\`', '``')
+    # ``text'' → "text"
+    text = re.sub(r"``([^']+)''", r'"\1"', text)
     text = text.replace('&#8203;', '')   # 零宽空格
     text = text.replace('&#8204;', '')   # 零宽不连字 (zwnj)
     text = text.replace('&zwnj;', '')    # 零宽不连字命名实体
@@ -414,6 +420,10 @@ def clean_mandoc_escapes(text: str) -> str:
     text = text.replace(r'\--', '--')
     # \`code\` → `code` （去除包裹反引号代码的单引号）
     text = re.sub(r"'`([^`]+)`'", r'`\1`', text)
+    # troff 单引号引用：`x' → `x`（单字符引用如 `v' `c' `n'）
+    # mandoc 输出 \`c' 形式，clean 后变成 `c'，缺少闭合反引号导致 MD038
+    # 将 `X'（X 为非反引号非单引号的字符）转换为 `X`
+    text = re.sub(r"`([A-Za-z0-9])'", r'`\1`', text)
     # 反引号代码内的斜体标记去除：`sysctl *hw.machine_arch*` → `sysctl hw.machine_arch`
     def deitalicize_code(m: re.Match) -> str:
         inner = m.group(1)
