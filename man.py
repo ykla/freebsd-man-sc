@@ -405,11 +405,19 @@ def clean_mandoc_escapes(text: str) -> str:
     text = text.replace('&#8592;', '←')  # 左箭头
     text = text.replace('&#8593;', '↑')  # 上箭头
     text = text.replace('&#8595;', '↓')  # 下箭头
+    # 取整符号（eqn 方程式块删除后 mandoc 输出的字符实体）
+    text = text.replace('&#8970;', '⌊')  # LEFT FLOOR
+    text = text.replace('&#8971;', '⌋')  # RIGHT FLOOR
+    text = text.replace('&#8968;', '⌈')  # LEFT CEILING
+    text = text.replace('&#8969;', '⌉')  # RIGHT CEILING
     # &gt; → >, &lt; → <, &amp; → &, &quot; → "
     text = text.replace('&gt;', '>').replace('&lt;', '<')
     text = text.replace('&amp;', '&').replace('&quot;', '"')
     # \_ → _ （转义下划线还原）
-    text = text.replace(r'\_', '_')
+    # 注意：只在 \_ 前后都有字母数字时还原（如 NG\_BTSOCKET → NG_BTSOCKET）
+    # 如果 \_ 在单词边界（开头/结尾），保留为 \_ 防止被识别为 italic（MD049）
+    # 如 \_pidx\_or\_credits\_ 保留为 \_pidx\_or\_credits\_
+    text = re.sub(r'(?<=[A-Za-z0-9])\\_(?=[A-Za-z0-9])', '_', text)
     # \* 保留转义（mandoc 在 emphasis 标记内转义 *，如 *16\*1024*，
     # 还原为 * 会导致 *16*1024* 触发 MD037/no-space-in-emphasis）
     # \` → ` （转义反引号还原）
@@ -731,6 +739,7 @@ def post_process(md: str, display_name: str, section: int,
     skipped_title = False
     skipped_footer = False
     current_section_header = ""  # 当前 ## 章节标题（大写）
+    subsection_counter: Dict[str, int] = {}  # 子章节标题重复计数（用于 ### 级别去重）
 
     i = 0
     while i < len(lines):
@@ -803,7 +812,17 @@ def post_process(md: str, display_name: str, section: int,
                 title = re.sub(r'\*([^*]+)\*', r'\1', title)
                 current_section_header = title.upper()
                 # 降级：增加一个 #
-                line = "#" * (hash_count + 1) + " " + title
+                new_hash_count = hash_count + 1
+                # 检测重复的子章节标题（### 级别），给重复的添加序号后缀
+                # 如 iflibdd.9 有多个 "Mandatory Functions" 子章节
+                if new_hash_count >= 3:
+                    title_key = title.lower().strip()
+                    if title_key in subsection_counter:
+                        subsection_counter[title_key] += 1
+                        title = f"{title} ({subsection_counter[title_key]})"
+                    else:
+                        subsection_counter[title_key] = 1
+                line = "#" * new_hash_count + " " + title
             else:
                 line = "#" + line
 
@@ -824,7 +843,8 @@ def post_process(md: str, display_name: str, section: int,
             line = re.sub(r'\*\*(device\s+\S+)\*\*', r'`\1`', line)
             # 路径斜体改加粗：*/path* → **/path**
             # 匹配 *...* 其中包含 / 的（路径），要求内容不含空格（避免误匹配运算符列表如 * / % ^*）
-            line = re.sub(r'\*([^\*\s]*/[^\*\s]*)\*', r'**\1**', line)
+            # 排除 URL（以 http:// 或 https:// 开头的），URL 保留斜体，由后续 URL 包裹处理为 <URL>
+            line = re.sub(r'\*(?!https?://)([^\*\s]*/[^\*\s]*)\*', r'**\1**', line)
             # 交叉引用链接化
             line = linkify_xref(line, section, xref)
 
@@ -1224,7 +1244,10 @@ def convert_tag_desc_to_list(text: str) -> str:
         out.append(lines[i])
         i += 1
 
-    return '\n'.join(out)
+    result = '\n'.join(out)
+    # 清理 eqn 方程式块残留语法（.EQ/.EN 删除后 mandoc 输出的 eqn 语法）
+    result = _clean_eqn_residue(result)
+    return result
 
 
 def ensure_blank_lines_around_tables(text: str) -> str:
@@ -2017,6 +2040,10 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
 
             # SYNOPSIS 章节特殊处理
             if current_section == 'SYNOPSIS':
+                # 跳过重复的 SYNOPSIS（如 ipfstat.8 有两个 .SH SYNOPSIS）
+                if current_section in seen_sections:
+                    in_synopsis = False  # 重复的 SYNOPSIS 不再进入概要模式
+                    continue
                 in_synopsis = True
                 synopsis_lines = []
                 out.append("## SYNOPSIS")
@@ -2498,6 +2525,76 @@ def _parse_tbl_column_spec(spec: str) -> str:
     return ':---'
 
 
+def _strip_eqn_blocks(text: str) -> Tuple[str, bool]:
+    """预处理 mdoc 源文件中的 eqn 方程式块（.EQ/.EN）。
+
+    mandoc 的 -Tmarkdown 后端不支持 .EQ/.EN 宏，遇到会触发断言失败
+    （mdoc_markdown.c 断言 tok >= MDOC_Dd && tok <= MDOC_MAX）。
+    本函数删除 .EQ 和 .EN 行（保留块内内容作为普通文本），
+    让 mandoc 把块内内容当成普通段落处理。
+
+    返回 (修改后的文本, 是否做了修改)。
+    """
+    if '.EQ' not in text:
+        return text, False
+    lines = text.split('\n')
+    out: List[str] = []
+    modified = False
+    for line in lines:
+        s = line.strip()
+        if s == '.EQ' or s.startswith('.EQ '):
+            modified = True
+            continue
+        if s == '.EN' or s.startswith('.EN '):
+            modified = True
+            continue
+        out.append(line)
+    if not modified:
+        return text, False
+    return '\n'.join(out), True
+
+
+# Unicode 下标/上标映射（0-9）
+_SUBSCRIPT_MAP = str.maketrans('0123456789', '₀₁₂₃₄₅₆₇₈₉')
+_SUPERSCRIPT_MAP = str.maketrans('0123456789', '⁰¹²³⁴⁵⁶⁷⁸⁹')
+
+
+def _clean_eqn_residue(text: str) -> str:
+    """清理 eqn 方程式块的语法残留。
+
+    .EQ/.EN 行被删除后，mandoc 会把块内 eqn 语法（如 `log sub 2 italic value`）
+    当成普通文本输出。本函数针对含取整符号 ⌊⌋⌈⌉ 的行，清理 eqn 语法残留：
+      - `sub 2` → `₂`（Unicode 下标）
+      - `sup 2` → `²`（Unicode 上标）
+      - `italic value` → `*value*`（markdown 斜体）
+      - `bold value` → `**value**`（markdown 粗体）
+
+    只处理含数学符号的行，避免误伤普通文本中的 sub/sup/italic/bold 单词。
+    """
+    MATH_SIGNS = ('⌊', '⌋', '⌈', '⌉')
+    if not any(sign in text for sign in MATH_SIGNS):
+        return text
+
+    def _clean_line(line: str) -> str:
+        if not any(sign in line for sign in MATH_SIGNS):
+            return line
+        # sub 2 → ₂（仅单数字）
+        line = re.sub(r'\bsub\s+(\d)',
+                      lambda m: m.group(1).translate(_SUBSCRIPT_MAP), line)
+        # sup 2 → ²（仅单数字）
+        line = re.sub(r'\bsup\s+(\d)',
+                      lambda m: m.group(1).translate(_SUPERSCRIPT_MAP), line)
+        # italic X → *X*
+        line = re.sub(r'\bitalic\s+(\S+)', r'*\1*', line)
+        # bold X → **X**
+        line = re.sub(r'\bbold\s+(\S+)', r'**\1**', line)
+        # 清理多余空格
+        line = re.sub(r' {2,}', ' ', line)
+        return line
+
+    return '\n'.join(_clean_line(ln) for ln in text.split('\n'))
+
+
 def _preprocess_tbl_tables(text: str) -> Tuple[str, Dict[str, str]]:
     """预处理 mdoc 源文件中的 tbl 表格，转换为 markdown 表格。
 
@@ -2961,10 +3058,13 @@ def convert_one(src_path: Path, out_dir: Path, xref: CrossRefDB,
         out_path.write_text(processed, encoding="utf-8")
     else:
         # mdoc 格式：mandoc + 后处理
-        # 先预处理 tbl 表格（.TS/.TE → markdown 占位符）
+        # 先预处理 eqn 方程式块（.EQ/.EN），避免 mandoc 崩溃
+        eqn_text, has_eqn = _strip_eqn_blocks(text)
+        text = eqn_text
+        # 再预处理 tbl 表格（.TS/.TE → markdown 占位符）
         processed_text, tbl_tables = _preprocess_tbl_tables(text)
-        if tbl_tables:
-            # 有 tbl 表格，写预处理后的临时源文件
+        if tbl_tables or has_eqn:
+            # 有 tbl 表格或 eqn 预处理，写预处理后的临时源文件
             tmp_src = out_dir / f".{out_name}.src.tmp"
             tmp_src.write_text(processed_text, encoding="utf-8")
             tmp_path = out_dir / f".{out_name}.tmp"
