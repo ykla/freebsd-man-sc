@@ -404,8 +404,8 @@ def clean_mandoc_escapes(text: str) -> str:
     text = text.replace('&amp;', '&').replace('&quot;', '"')
     # \_ → _ （转义下划线还原）
     text = text.replace(r'\_', '_')
-    # \* → * （转义星号还原）
-    text = text.replace(r'\*', '*')
+    # \* 保留转义（mandoc 在 emphasis 标记内转义 *，如 *16\*1024*，
+    # 还原为 * 会导致 *16*1024* 触发 MD037/no-space-in-emphasis）
     # \` → ` （转义反引号还原）
     text = text.replace(r'\`', '`')
     # 转义点号还原：4\.4BSD → 4.4BSD
@@ -822,10 +822,11 @@ def post_process(md: str, display_name: str, section: int,
         i += 1
 
     result = "\n".join(out)
+    # 先合并有序列表的断行续行：如 "1.\tFreeBSD\n\tGeneral Commands Manual"
+    # 必须在 convert_literal_blocks 之前，否则列表项的 tab 缩进续行会被误识别为代码块
+    result = merge_list_continuations(result)
     # 将 .Bd -literal 的 tab 缩进块转为 ```sh 代码围栏
     result = convert_literal_blocks(result)
-    # 合并有序列表的断行续行：如 "1.\tFreeBSD\n\tGeneral Commands Manual"
-    result = merge_list_continuations(result)
     # 合并被拆分的段落（mandoc 把每个内联宏单独成行）
     result = merge_broken_paragraphs(result)
     # 将连续的 **标签**\n\n描述 模式转换为无序列表（嵌套子选项）
@@ -892,6 +893,11 @@ def fix_ns_macro_damage(text: str) -> str:
     """
     # 修复 ***** 模式（多个连续星号）
     text = re.sub(r'\*{4,}', '**', text)
+    # 修复 .Sy \& * No 的 mandoc 输出：** \*&zwnj;** → *
+    # mandoc 把 .Sy（加粗）+ \&（零宽）+ * + No（恢复正常）输出为
+    # ** \*&zwnj;**，clean_mandoc_escapes 删除 &zwnj; 后变成 ** \***
+    # 此模式加粗标记内有空格，触发 MD037，替换为单独的 * 标记
+    text = re.sub(r'\*\* \\?\*+\*\*', '*', text)
     # 修复 ** ** 之间的空连接：**word** **:** → **word****:**
     # 这种损坏较难完美修复，仅做最小修复
     return text
@@ -2607,53 +2613,75 @@ def _tbl_to_markdown(tbl_lines: List[str]) -> str:
     if not alignments:
         return ''
 
-    # 计算每列表头内容的显示宽度（用于分隔行对齐）
-    col_widths = [_display_width(header_cells[j]) for j in range(len(alignments))]
+    # 计算每列的目标宽度：max(表头内容显示宽度, 分隔行最小宽度)
+    # 确保表头和分隔行管道符位置一致（满足 aligned_delimiter）
+    def _delim_min_width(align: str) -> int:
+        """分隔行单元格的最小显示宽度（含对齐说明符）。"""
+        if align == ':---:':
+            return 4  # :--:
+        # :---（左对齐）或 ---:（右对齐）或 ---（默认）
+        return 3  # :-- / --: / ---
 
-    def build_row(cells: List[str]) -> str:
-        """构建 compact 风格的表格行：管道符两侧各一个空格，空单元格为单空格。"""
+    col_widths = []
+    for j in range(len(alignments)):
+        header_w = _display_width(header_cells[j])
+        delim_w = _delim_min_width(alignments[j])
+        col_widths.append(max(header_w, delim_w))
+
+    def build_row(cells: List[str], is_header: bool = False) -> str:
+        """构建 compact 风格的表格行。
+
+        表头单元格用 \u00A0（不间断空格）填充到列宽，保持管道符对齐
+        （满足 aligned_delimiter）；\u00A0 被 micromark 视为内容而非
+        whitespace，不触发 compact 的 extra space 错误。
+        数据行不填充（aligned_delimiter 不检查数据行）。
+        """
         parts = []
-        for c in cells:
-            if c == '':
-                parts.append(' ')  # 空单元格：| |（单空格）
+        for j, c in enumerate(cells):
+            if is_header:
+                # 表头：填充到 col_widths[j]
+                if c == '':
+                    if col_widths[j] > 0:
+                        parts.append(' ' + '\u00A0' * col_widths[j] + ' ')
+                    else:
+                        parts.append(' ')
+                else:
+                    pad = col_widths[j] - _display_width(c)
+                    if pad > 0:
+                        c = c + '\u00A0' * pad
+                    parts.append(' ' + c + ' ')
             else:
-                parts.append(' ' + c + ' ')
+                if c == '':
+                    parts.append(' ')  # 空单元格：| |（单空格）
+                else:
+                    parts.append(' ' + c + ' ')
         return '|' + '|'.join(parts) + '|'
 
     # 构建表头行
-    md_lines.append(build_row(header_cells))
+    md_lines.append(build_row(header_cells, is_header=True))
 
     # 构建分隔行（compact 风格 + aligned_delimiter：管道符位置与表头对齐）
     delim_parts = []
     for j in range(len(alignments)):
         w = col_widths[j]
         align = alignments[j]
-        # 生成对齐说明符，显示宽度尽量与表头内容一致
+        # 生成对齐说明符，显示宽度与列宽一致
         if align == ':---:':
-            # 居中：:dashes:
-            if w >= 4:
-                dashes = '-' * (w - 2)
-            else:
-                dashes = '--'
+            # 居中：:dashes:（dashes = w - 2，至少 2）
+            dashes = '-' * max(w - 2, 2)
             delim_content = ':' + dashes + ':'
         elif align == '---:':
-            # 右对齐：dashes:
-            if w >= 2:
-                dashes = '-' * (w - 1)
-            else:
-                dashes = '--'
+            # 右对齐：dashes:（dashes = w - 1，至少 2）
+            dashes = '-' * max(w - 1, 2)
             delim_content = dashes + ':'
         else:
-            # 左对齐（:---）：:dashes
-            if w >= 2:
-                dashes = '-' * (w - 1)
-            else:
-                dashes = '--'
+            # 左对齐（:---）：:dashes（dashes = w - 1，至少 2）
+            dashes = '-' * max(w - 1, 2)
             delim_content = ':' + dashes
-        # 用空格填充使显示宽度与表头一致（管道符对齐）
+        # 若宽度仍不足（受 max 限制），用 dash 填充（不用空格，避免 compact 错误）
         pad = w - _display_width(delim_content)
         if pad > 0:
-            delim_content = delim_content + ' ' * pad
+            delim_content = delim_content + '-' * pad
         delim_parts.append(' ' + delim_content + ' ')
     md_lines.append('|' + '|'.join(delim_parts) + '|')
 
