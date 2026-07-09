@@ -2212,6 +2212,33 @@ def _th_format_synopsis(lines: List[str], display_name: str, section: int,
 # tbl 表格预处理器（.TS/.TE → markdown 表格）
 # ============================================================
 
+def _display_width(s: str) -> int:
+    """计算字符串的显示宽度（CJK 字符按 2 宽度计算）。"""
+    w = 0
+    for ch in s:
+        # CJK 统一表意文字、全角字符、日韩文等按 2 宽度
+        cp = ord(ch)
+        if (0x1100 <= cp <= 0x115F or    # Hangul Jamo
+            0x2E80 <= cp <= 0xA4CF or    # CJK 部首、康熙部首等
+            0xAC00 <= cp <= 0xD7A3 or    # Hangul Syllables
+            0xF900 <= cp <= 0xFAFF or    # CJK 兼容表意文字
+            0xFE30 <= cp <= 0xFE4F or    # CJK 兼容形式
+            0xFF00 <= cp <= 0xFF60 or    # 全角 ASCII
+            0xFFE0 <= cp <= 0xFFE6 or    # 全角符号
+            0x3000 <= cp <= 0x303F or    # CJK 符号和标点
+            0x3040 <= cp <= 0x33FF or    # 平假名、片假名、CJK 注音等
+            0x3400 <= cp <= 0x4DBF or    # CJK 扩展 A
+            0x4E00 <= cp <= 0x9FFF or    # CJK 统一表意文字
+            0xA000 <= cp <= 0xA4CF or    # 彝文
+            0xA960 <= cp <= 0xA97F or    # Hangul Jamo Extended-A
+            0xD7B0 <= cp <= 0xD7FF or    # Hangul Jamo Extended-B
+            0x20000 <= cp <= 0x2FFFD):   # CJK 扩展 B-F
+            w += 2
+        else:
+            w += 1
+    return w
+
+
 def _parse_tbl_column_spec(spec: str) -> str:
     """解析单个 tbl 列说明符，返回 markdown 对齐方式。
 
@@ -2539,30 +2566,100 @@ def _tbl_to_markdown(tbl_lines: List[str]) -> str:
         cell = cell.replace('\\0', ' ')
         # 清理多余空格
         cell = cell.strip()
+        # 转义管道符（在所有 roff 转义清理之后，避免 markdown 表格列错乱）
+        cell = cell.replace('|', '\\|')
         return cell
 
-    # 构建表头
+    # 构建表头和数据行的单元格列表
     if header_row:
         header_cells = [clean_cell(c) for c in header_row]
-        # 确保列数匹配
-        while len(header_cells) < len(alignments):
-            header_cells.append('')
-        header_cells = header_cells[:len(alignments)]
-        md_lines.append('| ' + ' | '.join(header_cells) + ' |')
     else:
-        # 无表头，生成空表头
-        md_lines.append('| ' + ' | '.join([''] * len(alignments)) + ' |')
+        header_cells = [''] * len(alignments)
+    while len(header_cells) < len(alignments):
+        header_cells.append('')
+    header_cells = header_cells[:len(alignments)]
 
-    # 分隔行
-    md_lines.append('|' + '|'.join(alignments) + '|')
-
-    # 数据行
+    cleaned_data_rows: List[List[str]] = []
     for row in data_rows:
         cells = [clean_cell(c) for c in row]
         while len(cells) < len(alignments):
             cells.append('')
         cells = cells[:len(alignments)]
-        md_lines.append('| ' + ' | '.join(cells) + ' |')
+        cleaned_data_rows.append(cells)
+
+    # 删除全空列（表头和所有数据行的该列均为空），避免空列导致对齐问题
+    non_empty_cols: Set[int] = set()
+    for j in range(len(alignments)):
+        if header_cells[j] != '':
+            non_empty_cols.add(j)
+            continue
+        for row in cleaned_data_rows:
+            if j < len(row) and row[j] != '':
+                non_empty_cols.add(j)
+                break
+
+    if len(non_empty_cols) < len(alignments):
+        keep = sorted(non_empty_cols)
+        alignments = [alignments[j] for j in keep]
+        header_cells = [header_cells[j] for j in keep]
+        cleaned_data_rows = [[row[j] for j in keep] for row in cleaned_data_rows]
+
+    if not alignments:
+        return ''
+
+    # 计算每列表头内容的显示宽度（用于分隔行对齐）
+    col_widths = [_display_width(header_cells[j]) for j in range(len(alignments))]
+
+    def build_row(cells: List[str]) -> str:
+        """构建 compact 风格的表格行：管道符两侧各一个空格，空单元格为单空格。"""
+        parts = []
+        for c in cells:
+            if c == '':
+                parts.append(' ')  # 空单元格：| |（单空格）
+            else:
+                parts.append(' ' + c + ' ')
+        return '|' + '|'.join(parts) + '|'
+
+    # 构建表头行
+    md_lines.append(build_row(header_cells))
+
+    # 构建分隔行（compact 风格 + aligned_delimiter：管道符位置与表头对齐）
+    delim_parts = []
+    for j in range(len(alignments)):
+        w = col_widths[j]
+        align = alignments[j]
+        # 生成对齐说明符，显示宽度尽量与表头内容一致
+        if align == ':---:':
+            # 居中：:dashes:
+            if w >= 4:
+                dashes = '-' * (w - 2)
+            else:
+                dashes = '--'
+            delim_content = ':' + dashes + ':'
+        elif align == '---:':
+            # 右对齐：dashes:
+            if w >= 2:
+                dashes = '-' * (w - 1)
+            else:
+                dashes = '--'
+            delim_content = dashes + ':'
+        else:
+            # 左对齐（:---）：:dashes
+            if w >= 2:
+                dashes = '-' * (w - 1)
+            else:
+                dashes = '--'
+            delim_content = ':' + dashes
+        # 用空格填充使显示宽度与表头一致（管道符对齐）
+        pad = w - _display_width(delim_content)
+        if pad > 0:
+            delim_content = delim_content + ' ' * pad
+        delim_parts.append(' ' + delim_content + ' ')
+    md_lines.append('|' + '|'.join(delim_parts) + '|')
+
+    # 构建数据行
+    for row in cleaned_data_rows:
+        md_lines.append(build_row(row))
 
     return '\n'.join(md_lines)
 
