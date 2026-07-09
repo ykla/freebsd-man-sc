@@ -835,6 +835,8 @@ def post_process(md: str, display_name: str, section: int,
     result = fix_ns_macro_damage(result)
     # 修复孤立 *** 行（mandoc 把 .Va * 等输出为 *，三个 * 形成水平线）
     result = re.sub(r'\n\*\*\*\n', '\n\\\\*\n', result)
+    # 确保标题、列表、代码围栏前后有空行（满足 MD022/MD031/MD032）
+    result = ensure_blank_lines_around_blocks(result)
     # 清理多余空行
     result = re.sub(r'\n{3,}', '\n\n', result)
     return result.strip() + "\n"
@@ -1272,6 +1274,89 @@ def ensure_blank_lines_around_tables(text: str) -> str:
 
         out.append(line)
         i += 1
+
+    return '\n'.join(out)
+
+
+def ensure_blank_lines_around_blocks(text: str) -> str:
+    """确保标题、列表、代码围栏前后有空行（满足 MD022/MD031/MD032）。
+
+    规则：
+    - 标题（## 等）前如果不是空行/文件开头，插入空行
+    - 标题后如果不是空行/文件末尾，插入空行
+    - 代码围栏 ``` 前后如果不是空行/边界，插入空行
+    - 列表项（- 或 1.）前如果不是空行/文件开头/列表项/标题，插入空行
+    - 列表后如果不是空行/文件末尾/列表项/标题，插入空行
+    - 不处理代码块内部内容
+    """
+    lines = text.split('\n')
+    out: List[str] = []
+    in_code_block = False
+
+    def is_blank(s: str) -> bool:
+        return s.strip() == ''
+
+    def is_heading(s: str) -> bool:
+        return bool(re.match(r'^#{1,6}\s', s))
+
+    def is_list_item(s: str) -> bool:
+        return bool(re.match(r'^[-*+]\s', s) or re.match(r'^\d+\.\s', s))
+
+    def is_fence(s: str) -> bool:
+        return s.strip().startswith('```')
+
+    for line in lines:
+        # 代码围栏
+        if is_fence(line):
+            if not in_code_block:
+                # 代码块开始：前面需空行
+                if out and not is_blank(out[-1]):
+                    out.append('')
+                out.append(line)
+                in_code_block = True
+            else:
+                # 代码块结束
+                out.append(line)
+                in_code_block = False
+            continue
+
+        if in_code_block:
+            # 代码块内部，原样输出
+            out.append(line)
+            continue
+
+        # 标题
+        if is_heading(line):
+            if out and not is_blank(out[-1]):
+                out.append('')
+            out.append(line)
+            continue
+
+        # 列表项
+        if is_list_item(line):
+            # 前一行非空且非列表项非标题时，插入空行
+            if (out and not is_blank(out[-1])
+                    and not is_list_item(out[-1])
+                    and not is_heading(out[-1])):
+                out.append('')
+            out.append(line)
+            continue
+
+        # 普通行：检查是否需要在前方插入空行
+        prev = out[-1] if out else ''
+        if not is_blank(line):
+            # 上一行是标题 → 插入空行
+            if is_heading(prev):
+                out.append('')
+            # 上一行是代码围栏结束 → 插入空行
+            elif is_fence(prev) and not in_code_block:
+                out.append('')
+            # 上一行是列表项，当前非列表项非空行非标题非围栏 → 插入空行（列表结束）
+            elif (is_list_item(prev) and not is_list_item(line)
+                  and not is_heading(line) and not is_fence(line)):
+                out.append('')
+
+        out.append(line)
 
     return '\n'.join(out)
 
@@ -1971,6 +2056,10 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
     result = re.sub(r'(?<!_)_\s+_(?!_)', '', result)
     # 清理 **** 系列（重复 bold 开关）→ 空
     result = re.sub(r'\*{4,}', '', result)
+    # 确保标题、列表、代码围栏前后有空行（满足 MD022/MD031/MD032）
+    result = ensure_blank_lines_around_blocks(result)
+    # 清理多余空行
+    result = re.sub(r'\n{3,}', '\n\n', result)
     return result.strip() + '\n'
 
 
