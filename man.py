@@ -2168,9 +2168,8 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
     result = re.sub(r'(?<!\*)\*\s+\*(?!\*)', '', result)
     # 清理 **** 系列（重复 bold 开关）→ 空
     result = re.sub(r'\*{4,}', '', result)
-    # 修复 *** 模式（bold 关闭 + italic 开启/关闭产生 ***，避免 MD037）
-    # 简化为 **（bold 关闭），因为源文件的 *** 都是字体切换产生，非合法 bold+italic
-    result = re.sub(r'\*\*\*', '**', result)
+    # 注意：不再做 *** → ** 的简单替换，因为会误吞 \*** 中的 *（转义 * + bold 关闭 **）
+    # *** 模式已由 th_process_font_markup 的 pending_reopen 机制在源头防止
     # 包裹裸 URL（满足 MD034），排除已在 <> 内或代码块内的
     result = re.sub(r'(?<![<(\[])(https?://[^\s<>()\]]+)', r'<\1>', result)
     # 包裹裸邮箱地址（满足 MD034），排除已在 <> 内的
