@@ -847,6 +847,9 @@ def post_process(md: str, display_name: str, section: int,
     result = re.sub(r'\n\*\*\*\n', '\n\\\\*\n', result)
     # 包裹裸 URL（满足 MD034）
     result = re.sub(r'(?<![<(\[])(https?://[^\s<>()\]]+)', r'<\1>', result)
+    # 包裹裸邮箱地址（满足 MD034），排除已在 <> 内的
+    # 如 ntptrace.8 的 autogen-users@lists.sourceforge.net
+    result = re.sub(r'(?<![<\w])([\w.+-]+@[\w.-]+\.\w{2,})', r'<\1>', result)
     # 转义行首的 # 防止被识别为 H1（如 .Dl 输出的配置文件注释 # default instance）
     # 只转义 # 后跟小写字母/数字且不含括号的行（排除 # name(N) 格式的合法标题）
     def _escape_config_hash(m: re.Match) -> str:
