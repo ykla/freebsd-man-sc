@@ -832,6 +832,8 @@ def post_process(md: str, display_name: str, section: int,
     result = convert_tag_desc_to_list(result)
     # 修复 .Ns 宏产生的损坏输出：*** → ** ** 之间的分隔
     result = fix_ns_macro_damage(result)
+    # 修复孤立 *** 行（mandoc 把 .Va * 等输出为 *，三个 * 形成水平线）
+    result = re.sub(r'\n\*\*\*\n', '\n\\\\*\n', result)
     # 清理多余空行
     result = re.sub(r'\n{3,}', '\n\n', result)
     return result.strip() + "\n"
@@ -2092,11 +2094,13 @@ def _th_format_synopsis(lines: List[str], display_name: str, section: int,
             in_sig_block = True
             if macro in ('B', 'SB', 'I', 'SM'):
                 content = th_clean_escapes(rest)
+                content = th_strip_font_markup(content)
             else:
                 _, args = th_split_macro_args(stripped)
                 if args:
                     # 代码块中不需要字体标记，直接清理转义连接
                     content = ''.join(th_clean_escapes(a) for a in args)
+                    content = th_strip_font_markup(content)
                 else:
                     content = ''
             if content:
@@ -2105,6 +2109,7 @@ def _th_format_synopsis(lines: List[str], display_name: str, section: int,
 
         # 普通文本行（如 const char *malloc_conf;）
         content = th_clean_escapes(stripped)
+        content = th_strip_font_markup(content)
         if content:
             in_sig_block = True
             sig_lines.append(content)
@@ -2248,6 +2253,9 @@ def _tbl_to_markdown(tbl_lines: List[str]) -> str:
             else:
                 state = 'format'
                 format_lines.append(stripped)
+                # 格式行可能只有一行且以 . 结尾，直接进入数据状态
+                if stripped.strip().endswith('.'):
+                    state = 'data'
         elif state == 'format':
             if stripped.strip().endswith('.'):
                 # 格式结束
