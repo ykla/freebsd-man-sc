@@ -977,6 +977,9 @@ def is_block_boundary(line: str, lines: Optional[List[str]] = None, idx: int = -
     # 表格行
     if s.startswith('|'):
         return True
+    # tbl 表格占位符（不与段落合并，避免表格首行被合并到段落末尾）
+    if re.match(r'^__TBL_\d+__$', s):
+        return True
     # HTML 标签
     if s.startswith('<'):
         return True
@@ -1175,6 +1178,93 @@ def convert_tag_desc_to_list(text: str) -> str:
             continue
 
         out.append(lines[i])
+        i += 1
+
+    return '\n'.join(out)
+
+
+def ensure_blank_lines_around_tables(text: str) -> str:
+    """确保 markdown 表格与段落之间有空行隔开。
+
+    处理两种情况：
+    1. 表格首行被合并到段落末尾（如 "段落文本 | header1 | header2 |"）
+       → 拆分为 "段落文本\n\n| header1 | header2 |"
+    2. 表格块前后缺少空行 → 在表格块前后补空行
+
+    跳过代码块内的内容（``` 围栏内的 | 行不视为表格）。
+    """
+    lines = text.split('\n')
+    out: List[str] = []
+    in_code = False
+    i = 0
+    n = len(lines)
+
+    # 表格行检测：以 | 开头，含至少一个 | 分隔符
+    def is_table_row(s: str) -> bool:
+        s = s.strip()
+        if not s.startswith('|'):
+            return False
+        # 至少有 2 个 |（一列以上），且以 | 结尾或后续是分隔行
+        return s.count('|') >= 2
+
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+
+        # 代码块状态跟踪
+        if stripped.startswith('```'):
+            in_code = not in_code
+            out.append(line)
+            i += 1
+            continue
+
+        if in_code:
+            out.append(line)
+            i += 1
+            continue
+
+        # 检测表格首行被合并到段落末尾：
+        # "段落文本 | cell | cell |" 模式
+        if not stripped.startswith('|') and ' |' in stripped:
+            # 尝试找到表格开始位置：第一个后跟表格模式的 " |"
+            # 表格行模式：| cell | cell | ... |（至少 2 个 |，以 | 结尾）
+            m = re.search(r'(.+?)\s+(\|.+\|.+\|\s*)$', stripped)
+            if m:
+                prefix = m.group(1).rstrip()
+                table_first = m.group(2).rstrip()
+                # 验证 table_first 确实是表格行（以 | 开头，至少 2 个 |）
+                if table_first.startswith('|') and table_first.count('|') >= 2:
+                    # 输出段落文本
+                    out.append(prefix)
+                    # 确保段落与表格之间有空行
+                    if not out or out[-1].strip() != '':
+                        out.append('')
+                    out.append(table_first)
+                    i += 1
+                    # 继续收集后续表格行
+                    while i < n and is_table_row(lines[i]):
+                        out.append(lines[i].rstrip())
+                        i += 1
+                    # 确保表格后有空行
+                    if i < n and lines[i].strip() != '':
+                        out.append('')
+                    continue
+
+        # 检测表格块（以 | 开头的连续行）
+        if is_table_row(stripped):
+            # 确保表格前有空行
+            if out and out[-1].strip() != '':
+                out.append('')
+            # 收集所有表格行
+            while i < n and is_table_row(lines[i]):
+                out.append(lines[i].rstrip())
+                i += 1
+            # 确保表格后有空行
+            if i < n and lines[i].strip() != '':
+                out.append('')
+            continue
+
+        out.append(line)
         i += 1
 
     return '\n'.join(out)
@@ -2537,6 +2627,9 @@ def convert_one(src_path: Path, out_dir: Path, xref: CrossRefDB,
         # 替换 tbl 占位符
         for placeholder, md_table in tbl_tables.items():
             processed = processed.replace(placeholder, md_table)
+        # 确保 tbl 表格与段落之间有空行隔开
+        if tbl_tables:
+            processed = ensure_blank_lines_around_tables(processed)
         out_path.write_text(processed, encoding="utf-8")
         tmp_path.unlink(missing_ok=True)
 
