@@ -1585,6 +1585,9 @@ def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) ->
         current_font = state.get('current', 'R')
         prev_font = state.get('prev', 'R')
     result: List[str] = []
+    # pending_reopen: 记录刚关闭的字体标记（如 '**' 表示刚关闭 B），用于检测 \fR\fB 这种
+    # 多余的关闭+开启对（中间无文本），取消这对操作以避免产生连续 *** 导致 MD037
+    pending_reopen: Optional[str] = None
     i = 0
     n = len(text)
     while i < n:
@@ -1599,18 +1602,33 @@ def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) ->
                 if new_font == current_font:
                     i += 3
                     continue
+                # 检测 \fR\fB 这种多余的关闭+开启对（刚关闭 X，现在开启 X，中间无文本）
+                # 此时取消关闭+开启，恢复 current_font 到关闭前的字体
+                new_open_marker = {'B': '**', 'I': '*', 'CW': '`'}.get(new_font)
+                if pending_reopen is not None and pending_reopen == new_open_marker and pending_reopen != '':
+                    # 移除末尾的关闭标记，不输出开启标记，恢复字体
+                    if result and isinstance(result[-1], str) and result[-1] == pending_reopen:
+                        result.pop()
+                    current_font = new_font
+                    pending_reopen = None
+                    i += 3
+                    continue
                 # 字体真正改变时更新 prev_font
                 if font != 'P':
                     prev_font = current_font
                 # 关闭当前字体标记（先去掉文本末尾的空格，避免 **text ** 模式 MD037）
+                close_marker = ''
                 if current_font in ('B', 'I', 'CW'):
                     while result and isinstance(result[-1], str) and result[-1] == ' ':
                         result.pop()
                 if current_font == 'B':
+                    close_marker = '**'
                     result.append('**')
                 elif current_font == 'I':
+                    close_marker = '*'
                     result.append('*')
                 elif current_font == 'CW':
+                    close_marker = '`'
                     result.append('`')
                 current_font = new_font
                 # 开启新字体标记
@@ -1618,6 +1636,10 @@ def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) ->
                     result.append('**')
                 elif current_font == 'I':
                     result.append('*')
+                elif current_font == 'CW':
+                    result.append('`')
+                # 记录刚关闭的字体标记（用于检测后续的 \fX 是否是多余的开启）
+                pending_reopen = close_marker if close_marker else None
                 i += 3
                 continue
             # 双字符字体名：\\f(CW \\f(CR 等
@@ -1648,7 +1670,15 @@ def th_process_font_markup(text: str, state: Optional[Dict[str, str]] = None) ->
                     result.append('*')
                 i += 5
                 continue
-        result.append(text[i])
+        # 在非 roman 字体（B/I/CW）内，文本中的 * 字符需转义为 \*，
+        # 避免与字体标记的 * 混淆（如 \fI*miblenp\fR 中的指针 * 被误解为 italic 开关）
+        ch = text[i]
+        if ch == '*' and current_font != 'R':
+            result.append('\\*')
+        else:
+            result.append(ch)
+        # 输出文本字符后，清空 pending_reopen（关闭标记后已有文本，关闭生效）
+        pending_reopen = None
         i += 1
     # 更新状态（不关闭未闭合的标记，由调用方在段落边界处理）
     if state is not None:
@@ -1725,8 +1755,11 @@ def th_format_alternating(macro: str, args: List[str]) -> str:
         font = fonts[idx % len(fonts)]
         cleaned = th_clean_escapes(arg)
         if font == 'B':
+            # 转义文本中的 * 避免 **text*** 模式（如 .BR FILE * → **FILE \***）
+            cleaned = cleaned.replace('*', '\\*')
             result.append(f'**{cleaned}**')
         elif font == 'I':
+            cleaned = cleaned.replace('*', '\\*')
             result.append(f'*{cleaned}*')
         else:  # R
             result.append(cleaned)
@@ -2056,12 +2089,12 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
             # 分割参数
             if macro in ('B', 'I', 'SB', 'SM'):
                 # .B text → **text** 或 *text*（asterisk 风格，满足 MD049/MD050）
-                content = th_clean_escapes(rest)
-                content = th_process_font_markup(content)
-                if macro in ('B', 'SB'):
-                    formatted = f'**{content}**' if not content.startswith('**') else content
-                else:  # I, SM
-                    formatted = f'*{content}*' if not content.startswith('*') else content
+                # 将 content 包裹在 \fB...\fR（或 \fI...\fR）中再处理，
+                # 确保文本中的 * 在字体标记内被正确转义（如 .B FILE * → **FILE \***）
+                font_char = 'B' if macro in ('B', 'SB') else 'I'
+                wrapped = f'\\f{font_char}{rest}\\fR'
+                content_clean = th_clean_escapes(wrapped)
+                formatted = th_process_font_markup(content_clean)
             else:
                 # .BR .BI .IR .RB .RI .IB — 交替字体
                 _, args = th_split_macro_args(stripped)
@@ -2093,11 +2126,11 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
 
         # .B/.I 空参数后的下一行文本：应用字体宏
         if pending_font:
-            content_processed = th_process_font_markup(content)
-            if pending_font in ('B', 'SB'):
-                formatted = f'**{content_processed}**' if content_processed.strip() else ''
-            else:  # I, SM
-                formatted = f'*{content_processed}*' if content_processed.strip() else ''
+            # 包裹在 \fB/\fI...\fR 中处理，确保 * 被转义
+            font_char = 'B' if pending_font in ('B', 'SB') else 'I'
+            wrapped = f'\\f{font_char}{content}\\fR'
+            content_clean = th_clean_escapes(wrapped)
+            formatted = th_process_font_markup(content_clean)
             pending_font = None
             if pending_tp:
                 out.append(f"- {formatted}")
