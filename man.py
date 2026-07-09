@@ -835,6 +835,10 @@ def post_process(md: str, display_name: str, section: int,
     result = fix_ns_macro_damage(result)
     # 修复孤立 *** 行（mandoc 把 .Va * 等输出为 *，三个 * 形成水平线）
     result = re.sub(r'\n\*\*\*\n', '\n\\\\*\n', result)
+    # 包裹裸 URL（满足 MD034）
+    result = re.sub(r'(?<![<(\[])(https?://[^\s<>()\]]+)', r'<\1>', result)
+    # 清理尾部空格（满足 MD009）
+    result = re.sub(r'[ \t]+\n', '\n', result)
     # 确保标题、列表、代码围栏前后有空行（满足 MD022/MD031/MD032）
     result = ensure_blank_lines_around_blocks(result)
     # 清理多余空行
@@ -1770,6 +1774,7 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
     # .TP 标签处理
     pending_tp = False  # 下一行是 .TP 的标签
     pending_ip_desc = False  # .IP 标签已输出，等待描述
+    pending_font = None  # .B/.I 空参数时，下一行文本的字体宏
 
     # 当前章节
     current_section = ""
@@ -2000,6 +2005,10 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
             macro = m.group(1)
             rest = m.group(2)
             flush_para()
+            # .B/.I/.SB/.SM 空参数：下一行文本才是内容
+            if macro in ('B', 'I', 'SB', 'SM') and not rest.strip():
+                pending_font = macro
+                continue
             # 分割参数
             if macro in ('B', 'I', 'SB', 'SM'):
                 # .B text → **text** 或 *text*（asterisk 风格，满足 MD049/MD050）
@@ -2027,6 +2036,21 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
         # 普通文本行（含 \fB \fI 等内联标记）
         # 只做 clean_escapes，加入段落缓冲区，统一处理字体标记
         content = th_clean_escapes(line)
+
+        # .B/.I 空参数后的下一行文本：应用字体宏
+        if pending_font:
+            content_processed = th_process_font_markup(content)
+            if pending_font in ('B', 'SB'):
+                formatted = f'**{content_processed}**' if content_processed.strip() else ''
+            else:  # I, SM
+                formatted = f'*{content_processed}*' if content_processed.strip() else ''
+            pending_font = None
+            if pending_tp:
+                out.append(f"- {formatted}")
+                pending_tp = False
+            elif formatted:
+                out.append(formatted)
+            continue
 
         if pending_tp:
             # 这是 .TP 后的标签行（普通文本）
@@ -2057,6 +2081,10 @@ def convert_th_to_markdown(text: str, display_name: str, section: int,
     result = re.sub(r'(?<!\*)\*\s+\*(?!\*)', '', result)
     # 清理 **** 系列（重复 bold 开关）→ 空
     result = re.sub(r'\*{4,}', '', result)
+    # 包裹裸 URL（满足 MD034），排除已在 <> 内或代码块内的
+    result = re.sub(r'(?<![<(\[])(https?://[^\s<>()\]]+)', r'<\1>', result)
+    # 清理尾部空格（满足 MD009）
+    result = re.sub(r'[ \t]+\n', '\n', result)
     # 确保标题、列表、代码围栏前后有空行（满足 MD022/MD031/MD032）
     result = ensure_blank_lines_around_blocks(result)
     # 清理多余空行
